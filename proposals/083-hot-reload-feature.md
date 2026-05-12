@@ -1,4 +1,4 @@
-# Changing Active Proxy Configuration
+# 83 - Changing Active Proxy Configuration
 
 **Builds on:** [Proposal 016 — Virtual Cluster Lifecycle](https://github.com/kroxylicious/design/blob/main/proposals/016-virtual-cluster-lifecycle.md)
 
@@ -31,66 +31,70 @@ The central operation is:
 
 ```java
 class KafkaProxy {
-    // ... add the following method
+  // ... add the following method
 
-    /**
-     * Apply the given configuration to this running proxy, restarting only the
-     * virtual clusters whose effective configuration differs from the current
-     * running state. Unaffected clusters continue serving traffic throughout
-     * the apply.
-     *
-     * <h2>Scope</h2>
-     * <p>This method applies only the virtual-cluster sections of the configuration
-     * and the named filter definitions that those virtual clusters reference.
-     * Other configuration sections (management, metrics, admin, etc.) are out of
-     * scope and are not reconciled by this operation; changes to those sections
-     * still require a proxy restart.
-     *
-     * <h2>Validation contract</h2>
-     * <p>Static validation (schema conformance, required fields, field-value
-     * ranges, internal consistency) is the caller's responsibility and is
-     * expected to have been performed on {@code newConfig} before this method
-     * is called.
-     *
-     * <p>Validation which depends on runtime state (port conflicts, plugin
-     * instantiation, TLS material readability) is performed during
-     * {@code applyConfiguration()} and reported via the returned future's
-     * {@link ConfigurationResult}.
-     *
-     * <h2>Error reporting</h2>
-     * <p>This method throws synchronously <em>only</em> for programmer errors:
-     * <ul>
-     *   <li>{@link NullPointerException} if {@code newConfig} is {@code null};</li>
-     *   <li>{@link IllegalStateException} if the proxy has not been started or
-     *       has been shut down.</li>
-     * </ul>
-     *
-     * <p>All other failures surface through the returned future:
-     * <ul>
-     *   <li><b>Catastrophic failure</b> — the apply could not be evaluated (e.g.
-     *       internal proxy bug, unexpected I/O failure inside the orchestrator).
-     *       The future completes exceptionally.</li>
-     *   <li><b>Per-component failure</b> — the apply was evaluated and one or
-     *       more components (virtual clusters or referenced filters) failed to
-     *       converge. The future completes normally with a {@code ConfigurationResult}
-     *       whose {@code errors()} collection is non-empty.</li>
-     * </ul>
-     *
-     * <p>Failure-handling policy (whether to shut down on partial failure, attempt
-     * a rollback, alert, or retry) is the caller's responsibility, expressed via
-     * the standard {@link java.util.concurrent.CompletableFuture#whenComplete}
-     * pattern. The proxy itself takes no policy action based on {@code errors()};
-     * it only reports.
-     *
-     * @param newConfig the desired end-state configuration; must be non-null
-     *                  and statically valid
-     * @return a future that completes with a {@link ConfigurationResult} describing
-     *         any per-component failures encountered while applying the
-     *         configuration
-     * @throws NullPointerException  if {@code newConfig} is {@code null}
-     * @throws IllegalStateException if the proxy is not in the running state
-     */
-    public CompletableFuture<ConfigurationResult> applyConfiguration(Configuration newConfig);
+  /**
+   * Apply the given configuration to this running proxy, restarting only the
+   * virtual clusters whose effective configuration differs from the current
+   * running state. Unaffected clusters continue serving traffic throughout
+   * the apply.
+   *
+   * <h2>Scope</h2>
+   * <p>This method handles <em>replacement</em> configurations on an already-running
+   * proxy. The initial configuration continues to be supplied via the {@link KafkaProxy}
+   * constructor at proxy startup; that path is unchanged by this proposal.
+   *
+   * <p>Within that scope, this method applies only the virtual-cluster sections of
+   * the configuration and the named filter definitions that those virtual clusters
+   * reference. Other configuration sections (management, metrics, admin, etc.) are
+   * out of scope and are not reconciled by this operation; changes to those sections
+   * still require a proxy restart.
+   *
+   * <h2>Validation contract</h2>
+   * <p>Static validation (schema conformance, required fields, field-value
+   * ranges, internal consistency) is the caller's responsibility and is
+   * expected to have been performed on {@code newConfig} before this method
+   * is called.
+   *
+   * <p>Validation which depends on runtime state (port conflicts, plugin
+   * instantiation, TLS material readability) is performed during
+   * {@code applyConfiguration()} and reported via the returned future's
+   * {@link ConfigurationResult}.
+   *
+   * <h2>Error reporting</h2>
+   * <p>This method throws synchronously <em>only</em> for programmer errors:
+   * <ul>
+   *   <li>{@link NullPointerException} if {@code newConfig} is {@code null};</li>
+   *   <li>{@link IllegalStateException} if the proxy has not been started or
+   *       has been shut down.</li>
+   * </ul>
+   *
+   * <p>All other failures surface through the returned future:
+   * <ul>
+   *   <li><b>Catastrophic failure</b> — the apply could not be evaluated (e.g.
+   *       internal proxy bug, unexpected I/O failure inside the orchestrator).
+   *       The future completes exceptionally.</li>
+   *   <li><b>Per-component failure</b> — the apply was evaluated and one or
+   *       more components (virtual clusters or referenced filters) failed to
+   *       converge. The future completes normally with a {@code ConfigurationResult}
+   *       whose {@code errors()} collection is non-empty.</li>
+   * </ul>
+   *
+   * <p>Failure-handling policy (whether to shut down on partial failure, attempt
+   * a rollback, alert, or retry) is the caller's responsibility, expressed via
+   * the standard {@link java.util.concurrent.CompletableFuture#whenComplete}
+   * pattern. The proxy itself takes no policy action based on {@code errors()};
+   * it only reports.
+   *
+   * @param newConfig the desired end-state configuration; must be non-null
+   *                  and statically valid
+   * @return a future that completes with a {@link ConfigurationResult} describing
+   *         any per-component failures encountered while applying the
+   *         configuration
+   * @throws NullPointerException  if {@code newConfig} is {@code null}
+   * @throws IllegalStateException if the proxy is not in the running state
+   */
+  public CompletableFuture<ConfigurationResult> applyConfiguration(Configuration newConfig);
 }
 ```
 
@@ -100,17 +104,17 @@ The caller provides a complete `Configuration` object. The proxy compares the in
 
 ```java
 public interface ConfigurationResult {
-    /**
-     * Returns the per-component failures encountered while applying the configuration.
-     * One entry per failed component (e.g. one virtual cluster, one referenced filter).
-     * Empty when the apply succeeded with no failed components.
-     * <p>
-     * The returned collection is immutable; iteration order is unspecified.
-     */
-    Collection<ConfigurationError> errors();
+  /**
+   * Returns the per-component failures encountered while applying the configuration.
+   * One entry per failed component (e.g. one virtual cluster, one referenced filter).
+   * Empty when the apply succeeded with no failed components.
+   * <p>
+   * The returned collection is immutable; iteration order is unspecified.
+   */
+  Collection<ConfigurationError> errors();
 
-    /** Convenience predicate equivalent to {@code !errors().isEmpty()}. */
-    default boolean hasErrors() { return !errors().isEmpty(); }
+  /** Convenience predicate equivalent to {@code !errors().isEmpty()}. */
+  default boolean hasErrors() { return !errors().isEmpty(); }
 }
 
 public record ConfigurationError(String humanReadableIdentifier, Throwable cause) { }
@@ -129,21 +133,21 @@ Because the proxy does not act on `errors()`, callers express their failure poli
 ```java
 proxy.applyConfiguration(newConfig)
      .whenComplete((result, ex) -> {
-         if (ex != null) {
-             LOGGER.atError().setCause(ex).log("Configuration apply failed catastrophically");
+        if (ex != null) {
+        LOGGER.atError().setCause(ex).log("Configuration apply failed catastrophically");
              proxy.shutdown();
              return;
-         }
-         for (var error : result.errors()) {
-             LOGGER.atError()
+                     }
+                     for (var error : result.errors()) {
+        LOGGER.atError()
                    .setCause(error.cause())
-                   .addKeyValue("component", error.humanReadableIdentifier())
-                   .log("Configuration apply failed for component");
+        .addKeyValue("component", error.humanReadableIdentifier())
+        .log("Configuration apply failed for component");
          }
-         if (result.hasErrors()) {
-             proxy.shutdown();
+                 if (result.hasErrors()) {
+        proxy.shutdown();
          }
-     });
+                 });
 ```
 
 The future completes with the aggregate result *before* any action is taken, so logging happens before shutdown — no ordering problem.
@@ -153,15 +157,15 @@ The future completes with the aggregate result *before* any action is taken, so 
 ```java
 proxy.applyConfiguration(newConfig)
      .whenComplete((result, ex) -> {
-         if (ex != null) {
-             alerter.send("catastrophic-apply-failure", ex);
+        if (ex != null) {
+        alerter.send("catastrophic-apply-failure", ex);
              return;
+                     }
+                     for (var error : result.errors()) {
+        alerter.send("component-apply-failure", error);
          }
-         for (var error : result.errors()) {
-             alerter.send("component-apply-failure", error);
-         }
-         // Surviving components continue serving; no proxy-level action taken.
-     });
+                 // Surviving components continue serving; no proxy-level action taken.
+                 });
 ```
 
 **Rollback on failure** (a sophisticated trigger):
@@ -169,16 +173,16 @@ proxy.applyConfiguration(newConfig)
 ```java
 proxy.applyConfiguration(newConfig)
      .whenComplete((result, ex) -> {
-         if (result != null && result.hasErrors()) {
-             proxy.applyConfiguration(oldConfig)
+        if (result != null && result.hasErrors()) {
+        proxy.applyConfiguration(oldConfig)
                   .whenComplete((rollbackResult, rollbackEx) -> {
-                      if (rollbackEx != null || rollbackResult.hasErrors()) {
-                          // rollback itself failed — last-resort policy
-                          proxy.shutdown();
+        if (rollbackEx != null || rollbackResult.hasErrors()) {
+        // rollback itself failed — last-resort policy
+        proxy.shutdown();
                       }
-                  });
-         }
-     });
+                              });
+                              }
+                              });
 ```
 
 Each of these is a trigger-side concern. The proxy does not need to know which policy is in use, and adding a new policy in the future does not require any proxy changes.
@@ -298,6 +302,20 @@ On per-VC failures:     keep successfully-applied changes in effect, complete
 On catastrophic error:  complete future exceptionally
 ```
 
+### Concurrency control
+
+Only one apply operation can execute at a time. The orchestrator uses a `ReentrantLock` to prevent overlap. A second `KafkaProxy.applyConfiguration()` call that arrives while an apply is in progress is **not queued**: it completes exceptionally with a `ConcurrentApplyException`. The trigger is expected to retry, typically with the most recent desired configuration.
+
+Rejecting (rather than queuing) the second call is deliberate. Queuing would raise three questions the proposal does not want to answer:
+
+- **Staleness**: a queued apply may carry configuration that is already obsolete by the time it executes (the trigger's source of truth has moved on). Triggers cannot easily detect this.
+- **Bounded depth**: an unbounded queue is a memory hazard; a bounded queue forces a "what to do when full?" policy, which is the very thing we're trying to avoid pushing into the proxy.
+- **Coalescing semantics**: should an arriving call replace the oldest queued call, the most recent one, or neither? Each choice is defensible and trigger-specific.
+
+By rejecting fast, the proxy forces these decisions onto the trigger, where they can be made with full knowledge of the trigger's source of truth. A trigger that wants "always apply the most recent config" can implement it cleanly via the rejection-and-retry loop (debounce, then call `applyConfiguration` with the latest config); a trigger that needs different semantics can implement those too without the proxy having pre-committed to a policy.
+
+`ConcurrentApplyException` is the exceptional-completion cause for this scenario (i.e. accessed via `future.exceptionally(...)` or the `ex` parameter of `whenComplete`, not thrown synchronously from `applyConfiguration` itself — that distinction matches the rest of the error-reporting contract).
+
 ### Worked examples
 
 All examples assume: VC-A and VC-B serving; `applyConfiguration(newConfig)` modifies both. Differences below are in what the caller's `whenComplete` does on failure.
@@ -357,9 +375,9 @@ The distinction between "per-VC failure" (future completes normally, `errors()` 
 
 The following metrics are part of the reload implementation:
 
-- **`kroxylicious_apply_total`** — counter of `KafkaProxy.applyConfiguration()` invocations, labelled by outcome (`success` = future completes with empty `errors()`; `partial_failure` = future completes with non-empty `errors()`; `catastrophic` = future completes exceptionally). Enables alerting on apply failures and tracking apply frequency.
-- **`kroxylicious_apply_duration_seconds`** — histogram of end-to-end apply duration. Helps operators understand whether apply is meeting SLA expectations and identify slow operations.
-- **`kroxylicious_apply_clusters_affected_total`** — counter of per-VC operations during apply, labelled by operation (`add`, `remove`, `modify`) and outcome (`success`, `failure`). Provides granularity beyond the aggregate result.
+- **`kroxylicious_apply_config_total`** — counter of `KafkaProxy.applyConfiguration()` invocations, labelled by outcome (`success` = future completes with empty `errors()`; `partial_failure` = future completes with non-empty `errors()`; `catastrophic` = future completes exceptionally). Enables alerting on apply failures and tracking apply frequency.
+- **`kroxylicious_apply_config_duration_seconds`** — histogram of end-to-end apply duration. Helps operators understand whether apply is meeting SLA expectations and identify slow operations.
+- **`kroxylicious_apply_config_clusters_affected_total`** — counter of per-VC operations during apply, labelled by operation (`add`, `remove`, `modify`) and outcome (`success`, `failure`). Provides granularity beyond the aggregate result.
 - **`kroxylicious_drain_duration_seconds`** — histogram of per-VC connection drain duration. Helps tune the `drainTimeout` configuration and detect VCs with long-lived connections.
 - **`kroxylicious_drain_connections_force_closed_total`** — counter of connections force-closed after drain timeout. A high rate indicates the drain timeout is too aggressive for the workload.
 
