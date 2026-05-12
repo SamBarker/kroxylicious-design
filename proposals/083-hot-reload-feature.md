@@ -1,4 +1,4 @@
-# 83 - Changing Active Proxy Configuration
+# Changing Active Proxy Configuration
 
 **Builds on:** [Proposal 016 — Virtual Cluster Lifecycle](https://github.com/kroxylicious/design/blob/main/proposals/016-virtual-cluster-lifecycle.md)
 
@@ -21,7 +21,7 @@ Administrators need to be able to modify proxy configuration in place. Common sc
 
 The proxy should apply these changes with minimal disruption: only the virtual clusters affected by the change should experience downtime. Unaffected clusters should continue serving traffic without interruption.
 
-This proposal also delivers the startup behaviour change that Proposal 016 made possible. With `serve: successful` and reload, an operator can let healthy VCs serve traffic while fixing a broken VC's config and re-applying — making per-VC independence useful rather than theoretical.
+This proposal also delivers the runtime capability that Proposal 016 made possible: with `applyConfiguration()` available, an operator (via whatever trigger they're using) can let healthy VCs continue serving while fixing a broken VC's config and re-applying — making per-VC independence useful rather than theoretical.
 
 ## Proposal
 
@@ -39,14 +39,23 @@ class KafkaProxy {
      * running state. Unaffected clusters continue serving traffic throughout
      * the apply.
      *
+     * <h2>Scope</h2>
+     * <p>This method applies only the virtual-cluster sections of the configuration
+     * and the named filter definitions that those virtual clusters reference.
+     * Other configuration sections (management, metrics, admin, etc.) are out of
+     * scope and are not reconciled by this operation; changes to those sections
+     * still require a proxy restart.
+     *
      * <h2>Validation contract</h2>
      * <p>Static validation (schema conformance, required fields, field-value
-     * ranges, internal consistency) is the embedder's responsibility and is
+     * ranges, internal consistency) is the caller's responsibility and is
      * expected to have been performed on {@code newConfig} before this method
      * is called.
      *
-     * <p>Validation which depends on runtime state (like port conflicts) 
-     * will be done during applyConfiguration() and reported through the ReloadResult
+     * <p>Validation which depends on runtime state (port conflicts, plugin
+     * instantiation, TLS material readability) is performed during
+     * {@code applyConfiguration()} and reported via the returned future's
+     * {@link ConfigurationResult}.
      *
      * <h2>Error reporting</h2>
      * <p>This method throws synchronously <em>only</em> for programmer errors:
@@ -55,85 +64,126 @@ class KafkaProxy {
      *   <li>{@link IllegalStateException} if the proxy has not been started or
      *       has been shut down.</li>
      * </ul>
-     * <p>All other failures &mdash; validation failures (runtime exceptions), lifecycle transition
-     * failures during drain or re-init, partial reloads &mdash; surface via
-     * exceptional completion of the returned future.
+     *
+     * <p>All other failures surface through the returned future:
+     * <ul>
+     *   <li><b>Catastrophic failure</b> — the apply could not be evaluated (e.g.
+     *       internal proxy bug, unexpected I/O failure inside the orchestrator).
+     *       The future completes exceptionally.</li>
+     *   <li><b>Per-component failure</b> — the apply was evaluated and one or
+     *       more components (virtual clusters or referenced filters) failed to
+     *       converge. The future completes normally with a {@code ConfigurationResult}
+     *       whose {@code errors()} collection is non-empty.</li>
+     * </ul>
+     *
+     * <p>Failure-handling policy (whether to shut down on partial failure, attempt
+     * a rollback, alert, or retry) is the caller's responsibility, expressed via
+     * the standard {@link java.util.concurrent.CompletableFuture#whenComplete}
+     * pattern. The proxy itself takes no policy action based on {@code errors()};
+     * it only reports.
      *
      * @param newConfig the desired end-state configuration; must be non-null
      *                  and statically valid
-     * @return a future that completes with a {@link ReloadResult} listing which
-     *         clusters ended up unchanged, added, restarted, removed, or failed
+     * @return a future that completes with a {@link ConfigurationResult} describing
+     *         any per-component failures encountered while applying the
+     *         configuration
      * @throws NullPointerException  if {@code newConfig} is {@code null}
      * @throws IllegalStateException if the proxy is not in the running state
      */
-    public CompletableFuture<ReloadResult> applyConfiguration(Configuration newConfig);
+    public CompletableFuture<ConfigurationResult> applyConfiguration(Configuration newConfig);
 }
 ```
 
-The caller provides a complete `Configuration` object. The proxy compares it against the currently running configuration, determines what changed, and applies the changes. The method returns a `CompletableFuture<ReloadResult>` that completes with a structured result on success or exceptionally on failure.
+The caller provides a complete `Configuration` object. The proxy compares the in-scope sections (virtual clusters + referenced named filters) against the currently running configuration, determines what changed, and applies the changes. The method returns a `CompletableFuture<ConfigurationResult>` that completes with the apply outcome or exceptionally on catastrophic failure.
 
-`ReloadResult` reports which clusters ended up in each terminal outcome of the apply:
+`ConfigurationResult` reports any per-component failures encountered during the apply. The interface is deliberately minimal: it only enumerates *what failed* and *why*, and leaves any reaction to the caller.
 
 ```java
-public record ReloadResult(
-    Set<String> clustersUnchanged,
-    Set<String> clustersAdded,
-    Set<String> clustersRestarted,
-    Set<String> clustersRemoved,
-    Set<String> failedClusters
-) {}
+public interface ConfigurationResult {
+    /**
+     * Returns the per-component failures encountered while applying the configuration.
+     * One entry per failed component (e.g. one virtual cluster, one referenced filter).
+     * Empty when the apply succeeded with no failed components.
+     * <p>
+     * The returned collection is immutable; iteration order is unspecified.
+     */
+    Collection<ConfigurationError> errors();
+
+    /** Convenience predicate equivalent to {@code !errors().isEmpty()}. */
+    default boolean hasErrors() { return !errors().isEmpty(); }
+}
+
+public record ConfigurationError(String humanReadableIdentifier, Throwable cause) { }
 ```
 
-In this approach: the caller provides the desired end state, and the proxy is responsible for computing and executing the diff. This is the right starting point — it is simple to reason about and avoids the complexity of delta-based or partial-update APIs. More granular approaches (deltas, targeted snapshots) may be worth exploring later, but the initial API should leave room for them without committing to them now.
+`ConfigurationError.humanReadableIdentifier` is a best-effort string that identifies which component failed (a virtual cluster name, a filter reference, etc.). The string's format is implementation-defined and intended for human consumption — operators reading logs, alerts, or admin endpoints. Programmatic consumers should rely on `cause` (the underlying exception) for typed failure detection rather than parsing the identifier.
+
+In this approach the caller provides the desired end state, the proxy computes and executes the diff, and the proxy reports per-component outcomes — but takes no action on those outcomes. The intentional minimalism preserves freedom of manoeuvre for the broader proxy-configuration rework tracked separately; richer APIs (categorised outcomes, structured identifiers, lifecycle event streams) can be added without breaking this contract.
+
+#### Caller-side failure handling
+
+Because the proxy does not act on `errors()`, callers express their failure policy via `whenComplete` on the returned future. Three illustrative patterns:
+
+**Shut down on any failure**:
+
+```java
+proxy.applyConfiguration(newConfig)
+     .whenComplete((result, ex) -> {
+         if (ex != null) {
+             LOGGER.atError().setCause(ex).log("Configuration apply failed catastrophically");
+             proxy.shutdown();
+             return;
+         }
+         for (var error : result.errors()) {
+             LOGGER.atError()
+                   .setCause(error.cause())
+                   .addKeyValue("component", error.humanReadableIdentifier())
+                   .log("Configuration apply failed for component");
+         }
+         if (result.hasErrors()) {
+             proxy.shutdown();
+         }
+     });
+```
+
+The future completes with the aggregate result *before* any action is taken, so logging happens before shutdown — no ordering problem.
+
+**Best-effort apply, keep what worked**:
+
+```java
+proxy.applyConfiguration(newConfig)
+     .whenComplete((result, ex) -> {
+         if (ex != null) {
+             alerter.send("catastrophic-apply-failure", ex);
+             return;
+         }
+         for (var error : result.errors()) {
+             alerter.send("component-apply-failure", error);
+         }
+         // Surviving components continue serving; no proxy-level action taken.
+     });
+```
+
+**Rollback on failure** (a sophisticated trigger):
+
+```java
+proxy.applyConfiguration(newConfig)
+     .whenComplete((result, ex) -> {
+         if (result != null && result.hasErrors()) {
+             proxy.applyConfiguration(oldConfig)
+                  .whenComplete((rollbackResult, rollbackEx) -> {
+                      if (rollbackEx != null || rollbackResult.hasErrors()) {
+                          // rollback itself failed — last-resort policy
+                          proxy.shutdown();
+                      }
+                  });
+         }
+     });
+```
+
+Each of these is a trigger-side concern. The proxy does not need to know which policy is in use, and adding a new policy in the future does not require any proxy changes.
 
 **Trigger mechanisms are explicitly out of scope for this proposal.** The `KafkaProxy.applyConfiguration()` operation is the internal interface that any trigger plugs into. How the new configuration arrives — whether via an HTTP endpoint, a file watcher detecting a changed ConfigMap, or a Kubernetes operator callback — is a separate concern. Deferring this keeps the proposal focused and avoids blocking on unresolved questions about trigger design (see [Trigger mechanisms](#trigger-mechanisms-future-work) below).
-
-### Two lifecycle policy layers
-
-Proposal 016's lifecycle model has two distinct policy points, each on a different edge of the state graph. This proposal refines the failure policy from a node-based hook (firing when a VC *arrives at* `Stopped`) to an edge-based hook (firing based on *which transition* brought it there).
-
-**Layer 1 — Per-VC recovery (`onVirtualClusterFailed`):**
-When a VC hits the `initializing → failed` edge, what happens to that VC? Retry? How many times? Proposal 016 explicitly deferred this to the reload proposal (*"recovery policies defined by a future reload proposal under onVirtualClusterFailed"*). It's a per-VC concern — VC-B getting 3 retry attempts has nothing to do with VC-A. In the initial implementation, retries are hardcoded to 0 — a failed VC immediately transitions to `stopped`. The seam exists in the code but is not exposed in configuration until retry with backoff is needed.
-
-**Layer 2 — Terminal failure (`onVirtualClusterTerminalFailure`):**
-When a VC traverses the `failed → stopped` edge — meaning it is truly unrecoverable — what's the blast radius? `serve: none` (proxy shuts down) or `serve: successful` (remaining VCs continue). This fires only on the `failed → stopped` edge, not on `draining → stopped` (intentional removal) or `initializing → stopped` (shutdown during startup). The lifecycle state model is unchanged — same states, same transitions. The intelligence is in the `VirtualClusterManager` knowing which transitions are policy-triggering, not in the state itself.
-
-### Configuration model
-
-Failure behaviour is deployment-level static configuration, split into two independent policy dimensions. A configuration apply triggered by an HTTP endpoint should behave identically to one triggered by a file watcher or an operator callback. These decisions belong in the proxy's static configuration, keeping the `
-KafkaProxy.applyConfiguration()` signature simple.
-
-```yaml
-proxy:
-  # Lifecycle: fires on the failed → stopped edge only
-  # Applies at startup AND reload
-  onVirtualClusterTerminalFailure:
-    serve: none              # none | successful
-
-  # Reload-specific settings
-  configurationReload:
-    onFailure:
-      rollback: true         # true | false
-    persistToDisk: true      # true | false
-```
-
-| Block | Field | Values | Description |
-|-------|-------|--------|-------------|
-| `onVirtualClusterTerminalFailure` | `serve` | `none` | **Default.** Any unrecoverable VC shuts down the proxy. |
-| | | `successful` | Remaining healthy VCs continue serving. Failed VC is reported. |
-| `configurationReload` | `onFailure.rollback` | `true` | **Default.** Atomic reload — revert all VCs to prior config on failure. |
-| | | `false` | Best-effort — keep what succeeded, let failed VCs die. |
-| | `persistToDisk` | `true` | **Default.** Write the new configuration to the config file (with `.bak` backup of the replaced file). |
-| | | `false` | Don't persist. The reload is in-memory only. |
-
-These two dimensions are independently meaningful, producing four distinct behaviours:
-
-| `rollback` | `serve` | Behaviour |
-|-----------|---------|-----------|
-| `true` | `none` | Atomic reload. Revert on failure. If revert itself fails, proxy dies. |
-| `true` | `successful` | Atomic reload. Revert on failure. If revert itself fails, surviving VCs continue. |
-| `false` | `none` | Best-effort. Any unrecoverable VC kills the proxy. |
-| `false` | `successful` | Best-effort. Failed VCs die, rest continue. (e.g. TLS enforcement case.) |
 
 ### Configuration change detection
 
@@ -148,17 +198,19 @@ Clusters where none of these changed are left untouched — they continue servin
 
 ### Cluster modification via lifecycle transitions
 
-A modified virtual cluster is restarted by driving it through the lifecycle states defined in Proposal 016. Proposal 016 defines the per-VC state machine (`VirtualClusterLifecycleState`) and the `VirtualClusterLifecycleManager` that enforces valid transitions. This proposal adds the reload operations that drive those transitions.
+A modified virtual cluster is restarted by driving it through the lifecycle states defined in Proposal 016. Proposal 016 defines the per-VC state machine (`VirtualClusterLifecycleState`) and the `VirtualClusterRegistry` that enforces valid transitions. This proposal adds the reload operations that drive those transitions.
 
 The three change operations map to lifecycle transitions as follows:
 
 **Modify (Restart VC):** `SERVING → DRAINING → [drain connections] → [deregister gateways] → INITIALIZING → [register gateways] → SERVING`
 
-A modified cluster is torn down and rebuilt with the new configuration. During restart, the lifecycle state cycles through Draining and back to Initializing without ever reaching the terminal Stopped state. This means the `onVirtualClusterTerminalFailure` callback does not fire during restart — reload is an internal VCM operation that stays within the lifecycle state machine.
+A modified cluster is torn down and rebuilt with the new configuration. During restart, the lifecycle state cycles through Draining and back to Initializing without ever reaching the terminal Stopped state.
 
 **Remove:** `SERVING → DRAINING → [drain connections] → [deregister gateways] → STOPPED`
 
-A removed cluster is permanently torn down. It reaches the terminal Stopped state via `draining → stopped`. This is an intentional removal, not a failure — the `onVirtualClusterTerminalFailure` callback does **not** fire (it only fires on the `failed → stopped` edge).
+A removed cluster is permanently torn down. It reaches the terminal Stopped state via `draining → stopped`. This is an intentional removal, not a failure; it is not reported through `ConfigurationResult.errors()`.
+
+If a *modify* or *add* operation fails — i.e. a VC traverses the `initializing → failed → stopped` path during the apply — the failure is reported as a `ConfigurationError` entry in the result returned to the caller. The caller decides whether to retry, rollback, alert, or shut down via the `whenComplete` patterns shown above.
 
 **Add:** `[create lifecycle manager in INITIALIZING] → [register gateways] → SERVING`
 
@@ -170,27 +222,12 @@ This means a modified cluster experiences a brief period of unavailability while
 
 ### Graceful connection draining
 
-Before tearing down a modified or removed cluster, the proxy drives its lifecycle from **Serving to Draining** (via `VirtualClusterLifecycleManager.startDraining()`). The detailed mechanics of connection draining — rejecting new connections, applying backpressure, waiting for in-flight requests, and force-closing after timeout — are defined as part of the `Draining` lifecycle state in Proposal 016 and its implementation. This proposal does not redefine that behaviour; it relies on the lifecycle state machine to handle drain semantics.
+Before tearing down a modified or removed cluster, the proxy drives its lifecycle from **Serving to Draining**. The detailed mechanics of connection draining — rejecting new connections, applying backpressure, waiting for in-flight requests, and force-closing after timeout — are defined as part of the `Draining` lifecycle state in Proposal 016 and its implementation. This proposal does not redefine that behaviour; it relies on the lifecycle state machine to handle drain semantics.
 
 Once all connections are drained (or the drain timeout expires), the lifecycle transitions out of Draining:
 - For **restart**, gateways are deregistered and re-registered, the lifecycle transitions through Initializing to Serving.
 - For **remove**, the lifecycle manager transitions from Draining to Stopped via `drainComplete()`. This is the `draining → stopped` edge — the terminal failure callback does **not** fire.
 
-### VirtualClusterManager integration
-
-[Proposal 016](https://github.com/kroxylicious/design/blob/main/proposals/016-virtual-cluster-lifecycle.md) defines `VirtualClusterManager` as the owner of the VC configuration tree and lifecycle state. It holds the `VirtualClusterModel` list, the per-VC `VirtualClusterLifecycleManager` instances, and the `onVirtualClusterTerminalFailure` callback.
-
-For hot reload, the `VirtualClusterManager` is extended with reload operations that combine lifecycle transitions with infrastructure actions:
-
-- **`removeVirtualCluster(clusterName, rollbackTracker)`** — drives `SERVING → DRAINING → [drain via ConnectionDrainManager] → [deregister via EndpointRegistry] → STOPPED`. This is the `draining → stopped` edge — callback does **not** fire. Tracks the removal for potential rollback.
-- **`restartVirtualCluster(clusterName, newModel, rollbackTracker)`** — drives `SERVING → DRAINING → [drain] → [deregister] → INITIALIZING → [register] → SERVING`. Never reaches Stopped; callback does not fire. If re-initialization fails: `INITIALIZING → FAILED → STOPPED` via the `failed → stopped` edge — callback **fires**. Tracks the modification for potential rollback.
-- **`addVirtualCluster(newModel, rollbackTracker)`** — creates a new lifecycle manager in Initializing, drives `[register via EndpointRegistry] → INITIALIZING → SERVING`. If initialization fails: `INITIALIZING → FAILED → STOPPED` via the `failed → stopped` edge — callback **fires**. Tracks the addition for potential rollback.
-
-The `VirtualClusterManager` gains two dependencies for reload operations:
-- `EndpointRegistry` — for gateway registration and deregistration (port binding/unbinding)
-- `ConnectionDrainManager` — for graceful connection draining during the Draining state
-
-The `ConfigurationChangeHandler` calls these `VirtualClusterManager` methods based on the `ChangeResult` from the detection pipeline.
 
 ### FilterChainFactory hot-swap
 
@@ -200,31 +237,21 @@ To support hot reload, `KafkaProxy` holds an `AtomicReference<FilterChainFactory
 - `KafkaProxyInitializer` — reads via `.get()` on each new connection, always getting the current factory
 - `ConfigurationReloadOrchestrator` — swaps via `.set()` after successful reload
 
-On success: the orchestrator atomically swaps to the new factory and closes the old one. On rollback: the new factory is closed and the reference remains unchanged. This ensures a clean transition with no race conditions between connection setup and factory replacement.
+On success: the orchestrator atomically swaps to the new factory and closes the old one. If the apply fails before the swap (e.g. the new factory cannot be constructed, or a VC re-initialization fails during the apply), the new factory is closed and the reference remains unchanged — the previous factory keeps serving. This ensures a clean transition with no race conditions between connection setup and factory replacement.
 
-### Failure behaviour and rollback
+### Failure behaviour
 
-When a VC operation fails during `KafkaProxy.applyConfiguration()`, two independent policies govern the response:
+When a VC operation fails during `KafkaProxy.applyConfiguration()`, the orchestrator does **not** take any policy action. It records the failure as a `ConfigurationError` entry and continues with the remaining changes. Once all change operations have been attempted, the aggregate `ConfigurationResult` is delivered to the caller via the returned future.
 
-**Orchestration policy (`configurationReload.onFailure.rollback`):**
+Specifically, on a per-VC failure:
 
-When `rollback: true` (default), the `ConfigurationChangeHandler` reverts all previously successful operations in reverse order via the `ConfigurationChangeRollbackTracker`. Rollback uses the same lifecycle transitions as normal operations — the state machine doesn't know or care whether it's applying new config or old config:
+- The failed VC traverses `initializing → failed → stopped` (per Proposal 016's lifecycle).
+- Other VCs that were already modified earlier in the apply are not reverted — their new configuration remains in effect.
+- Pending changes for other VCs continue to be processed.
 
-- For the failed VC: `failed → initializing` with the old config — this is just another initialization attempt
-- For successfully modified VCs: `serving → draining → initializing → serving` with the old config
-- For successfully added VCs: `serving → draining → stopped` (removed)
-- For successfully removed VCs: re-added via `addVirtualCluster` with the old model
+The caller receives the full set of failures and chooses the response (shutdown, rollback, alert, retry) via `whenComplete`. Three illustrative trigger-side patterns are shown in the [Core API](#core-api-kafkaproxyapplyconfiguration) section above.
 
-When `rollback: false`, the orchestrator does not revert. Successfully applied operations remain in effect. Failed VCs proceed through the lifecycle: `failed → stopped` (terminal failure edge) and the terminal failure policy applies.
-
-**Terminal failure policy (`onVirtualClusterTerminalFailure.serve`):**
-
-When a VC traverses the `failed → stopped` edge — whether during startup, reload, or a failed rollback — the terminal failure callback fires. The `serve` policy then determines the blast radius:
-
-- `serve: none` (default): the proxy shuts down. This matches current behaviour — configuration errors are surfaced immediately.
-- `serve: successful`: the proxy continues with remaining healthy VCs. The operator can inspect the failed VC and re-apply.
-
-These policies compose independently. `rollback` determines whether the orchestrator tries to restore previous config. `serve` determines what happens when a VC is truly unrecoverable. Neither knows about or depends on the other.
+Rollback, in particular, is a trigger-side concern: a trigger that wants atomic "all-or-nothing" semantics calls `applyConfiguration(oldConfig)` from its `whenComplete` callback when the previous apply returned non-empty `errors()`. The proxy does not know it is "rolling back" — it just runs another apply. This keeps the proxy implementation small and lets different deployment scenarios (CLI, operator, custom trigger) express different policies without proxy changes.
 
 ### Orchestration pipeline
 
@@ -233,7 +260,6 @@ The complete `KafkaProxy.applyConfiguration()` pipeline flows through these laye
 ```
 KafkaProxy.applyConfiguration(newConfig)
     │
-    ├── Reads configurationReload settings from bootstrap config
     ├── Guards: proxy must be running, orchestrator must be initialized
     │
     ▼
@@ -251,8 +277,10 @@ ConfigurationChangeHandler.handleConfigurationChange(context)
     │     VirtualClusterChangeDetector → added/removed/modified VCs
     │     FilterChangeDetector → VCs affected by filter changes
     │
-    ├── Creates ConfigurationChangeRollbackTracker
     ├── Processes changes in order: Remove → Modify → Add
+    │     For each change: invoke the corresponding VirtualClusterManager
+    │     method. Accumulate successes; collect failures as ConfigurationError
+    │     entries.
     │
     ▼
 VirtualClusterManager (for each affected VC)
@@ -262,94 +290,80 @@ VirtualClusterManager (for each affected VC)
     ├── addVirtualCluster:      INITIALIZING → register → SERVING
     │
     ▼
-On success: swap FilterChainFactory, update current config, optionally persist to disk
-On failure: apply rollback policy, then terminal failure policy if VC is unrecoverable
+On success (no errors): swap FilterChainFactory, update current config, complete
+                        future with ConfigurationResult.errors() empty
+On per-VC failures:     keep successfully-applied changes in effect, complete
+                        future with ConfigurationResult.errors() non-empty.
+                        The caller decides next steps via whenComplete.
+On catastrophic error:  complete future exceptionally
 ```
-
-### Concurrency control
-
-Only one reload operation can execute at a time. The `ConfigurationReloadOrchestrator` uses a `ReentrantLock` to prevent concurrent `KafkaProxy.applyConfiguration()` calls. A second call while a reload is in progress fails immediately with a `ConcurrentReloadException` rather than queuing.
 
 ### Worked examples
 
-#### Reload with atomic rollback (default: `rollback: true`)
+All examples assume: VC-A and VC-B serving; `applyConfiguration(newConfig)` modifies both. Differences below are in what the caller's `whenComplete` does on failure.
 
-Setup: VC-A and VC-B serving. Reload modifies both.
+#### Best-effort apply (CLI / operator that wants surviving VCs to keep serving)
 
 ```
 1. Modify VC-A → succeeds → VC-A serving with new config
-2. Modify VC-B → fails → VC-B enters failed
-
-Per-VC recovery (retries: 0 in first impl):
-3. No retries configured, recovery immediately exhausted
-
-Orchestration (rollback: true):
-4. Try VC-B with old config: failed → initializing → serving ✓
-5. Roll back VC-A: serving → draining → initializing → serving (old config) ✓
-6. All VCs back to previous known-good state
-7. Nothing reaches stopped. Terminal failure callback never fires.
+2. Modify VC-B → fails (e.g. upstream unreachable) → VC-B enters failed → stopped
+3. Future completes with: ConfigurationResult.errors() = [ConfigurationError("vc-b", IOException)]
+4. Caller's whenComplete logs the error and takes no further action.
+   VC-A continues serving with new config; VC-B is gone.
 ```
 
-#### Reload when rollback itself fails
+This matches the existing "serve: successful" behaviour, expressed entirely on the caller side.
+
+#### Fail-fast (CLI app that wants any failure to take down the proxy)
 
 ```
-1-3. Same as above — VC-B failed, retries exhausted
-
-Orchestration (rollback: true):
-4. Try VC-B with old config → also fails (environment issue?)
-5. VC-B is truly unrecoverable
-6. Roll back VC-A: serving → draining → initializing → serving (old config) ✓
-7. VC-B transitions failed → stopped (terminal failure edge — callback fires)
-
-Terminal failure (serve policy):
-8a. serve: none → proxy shuts down
-8b. serve: successful → VC-A continues serving (old config), VC-B is gone
+1. Modify VC-A → succeeds → VC-A serving with new config
+2. Modify VC-B → fails → VC-B enters failed → stopped
+3. Future completes with: ConfigurationResult.errors() = [ConfigurationError("vc-b", IOException)]
+4. Caller's whenComplete sees hasErrors() == true and calls proxy.shutdown().
+   The future has already delivered the result, so logging happens before shutdown.
 ```
 
-#### Reload with best-effort (`rollback: false`, `serve: successful`)
+This matches the existing "serve: none" behaviour, again expressed on the caller side.
 
-Setup: Enforcing new TLS cipher suites across all VCs.
-
-```
-1. Modify VC-A → succeeds → VC-A serving with new (secure) config
-2. Modify VC-B → fails → VC-B enters failed (upstream doesn't support new ciphers)
-
-Per-VC recovery: exhausted
-Orchestration (rollback: false): old config is unacceptable, don't revert
-
-3. VC-B transitions failed → stopped (terminal failure edge — callback fires)
-
-Terminal failure (serve: successful):
-4. VC-A continues serving with new cipher suites
-5. VC-B is reported as stopped — operator fixes upstream, re-applies
-```
-
-#### Startup (no reload)
+#### Atomic apply with rollback (sophisticated trigger)
 
 ```
-1. Proxy starting. Initializing VC-A and VC-B.
-2. VC-A → initializing → serving ✓
-3. VC-B → initializing → failed
-
-Per-VC recovery: exhausted (retries: 0)
-No reload transaction — there is no old config to roll back to.
-
-4. VC-B transitions failed → stopped (terminal failure edge — callback fires)
-
-Terminal failure (serve policy):
-5a. serve: none → proxy shuts down (current default behaviour, unchanged)
-5b. serve: successful → VC-A serves, VC-B reported as stopped
+1. Caller saves oldConfig before calling applyConfiguration(newConfig).
+2. Modify VC-A → succeeds (new config) → VC-A serving with new config.
+3. Modify VC-B → fails → VC-B enters failed → stopped.
+4. Future completes with: errors() non-empty.
+5. Caller's whenComplete calls applyConfiguration(oldConfig):
+     - Removes VC-A's new config, restores old config: VC-A drains and re-initializes
+     - Re-adds VC-B with old config: succeeds, VC-B back to serving
+6. Rollback's future completes with errors() empty. The system is back to oldConfig.
 ```
+
+If the rollback itself returns non-empty `errors()`, the trigger applies its last-resort policy (typically shutdown).
+
+#### Catastrophic failure
+
+```
+1. applyConfiguration(newConfig) is called.
+2. The orchestrator encounters an internal error (e.g. an unexpected runtime exception
+   in change-detection itself, not in any particular VC).
+3. Future completes exceptionally with that throwable.
+4. Caller's whenComplete sees ex != null and applies its catastrophic-error policy.
+```
+
+The distinction between "per-VC failure" (future completes normally, `errors()` non-empty) and "catastrophic failure" (future completes exceptionally) is the boundary between *the apply ran and at least one component failed* and *the apply could not be evaluated at all*.
 
 ### Metrics and observability
 
 The following metrics are part of the reload implementation:
 
-- **`kroxylicious_reload_total`** — counter of `KafkaProxy.applyConfiguration()` invocations, labelled by outcome (`success`, `rollback`, `failure`). Enables alerting on reload failures and tracking reload frequency.
-- **`kroxylicious_reload_duration_seconds`** — histogram of end-to-end reload duration. Helps operators understand whether reload is meeting SLA expectations and identify slow operations.
-- **`kroxylicious_reload_clusters_affected_total`** — counter of per-VC operations during reload, labelled by operation (`add`, `remove`, `modify`) and outcome (`success`, `failure`, `rolledback`). Provides granularity beyond the aggregate reload result.
+- **`kroxylicious_apply_total`** — counter of `KafkaProxy.applyConfiguration()` invocations, labelled by outcome (`success` = future completes with empty `errors()`; `partial_failure` = future completes with non-empty `errors()`; `catastrophic` = future completes exceptionally). Enables alerting on apply failures and tracking apply frequency.
+- **`kroxylicious_apply_duration_seconds`** — histogram of end-to-end apply duration. Helps operators understand whether apply is meeting SLA expectations and identify slow operations.
+- **`kroxylicious_apply_clusters_affected_total`** — counter of per-VC operations during apply, labelled by operation (`add`, `remove`, `modify`) and outcome (`success`, `failure`). Provides granularity beyond the aggregate result.
 - **`kroxylicious_drain_duration_seconds`** — histogram of per-VC connection drain duration. Helps tune the `drainTimeout` configuration and detect VCs with long-lived connections.
 - **`kroxylicious_drain_connections_force_closed_total`** — counter of connections force-closed after drain timeout. A high rate indicates the drain timeout is too aggressive for the workload.
+
+Note: there is no proxy-side `rollback` metric because rollback is a trigger-side concern (the trigger calls `applyConfiguration()` a second time with the previous configuration). Each apply — original or rollback — is counted independently as a regular invocation. Triggers that perform rollback can add their own metrics if needed.
 
 The per-VC lifecycle state metrics (`kroxylicious_virtual_cluster_state`, `kroxylicious_virtual_cluster_state_duration_seconds`, `kroxylicious_virtual_cluster_transitions_total`) defined in Proposal 016 complement these reload-specific metrics and should be implemented alongside them.
 
@@ -376,33 +390,23 @@ The `KafkaProxy.applyConfiguration()` operation is trigger-agnostic. The followi
 
 Each of these can be designed and implemented independently once the core `KafkaProxy.applyConfiguration()` mechanism is in place.
 
-## Affected/not affected projects
-
-**Affected:**
-
-- **kroxylicious-runtime** (core proxy) — The `KafkaProxy.applyConfiguration()` operation, change detection pipeline (`ChangeDetector`, `VirtualClusterChangeDetector`, `FilterChangeDetector`), reload orchestration (`ConfigurationReloadOrchestrator`, `ConfigurationChangeHandler`, `ConfigurationChangeRollbackTracker`), connection draining infrastructure, and lifecycle-integrated reload operations on `VirtualClusterManager` all live here. This builds on the lifecycle state model (`VirtualClusterLifecycleState`, `VirtualClusterLifecycleManager`, `VirtualClusterManager`) introduced by Proposal 016.
-- **kroxylicious-junit5-extension** — Test infrastructure may need to support applying configuration changes to a running proxy in integration tests.
-
-**Not affected:**
-
-- **kroxylicious-operator** — The operator will eventually be a trigger mechanism, but the core apply operation does not depend on it.
-- **Filter/plugin implementations** — Existing filters do not need to change. The plugin resource tracking gap (above) may eventually require filters to change how they read external resources, but that is a separate proposal.
-
 ## Compatibility
 
 - The `KafkaProxy.applyConfiguration()` operation is additive — it does not change existing startup behaviour.
-- The default configuration (`onVirtualClusterTerminalFailure.serve: none`, `configurationReload.onFailure.rollback: true`) matches current behaviour — the proxy shuts down if any VC fails at startup.
+- This proposal adds **no new YAML configuration**. All failure-handling policy is expressed by the caller via `whenComplete`.
 - Virtual cluster configuration semantics are unchanged; the proposal only adds the ability to apply changes at runtime.
 - Filter definitions and their configuration are unchanged.
-- No changes to the on-disk configuration file format beyond the optional `onVirtualClusterTerminalFailure` and `configurationReload` blocks.
-- The lifecycle state model (Proposal 016) is unchanged; this proposal only adds operations that drive transitions through the existing state machine and an edge-based policy hook on the `failed → stopped` transition.
+- The on-disk configuration file format is unchanged.
+- The lifecycle state model (Proposal 016) is unchanged; this proposal only adds operations that drive transitions through the existing state machine.
 
 ## Rejected alternatives
 
 - **File watcher as the primary trigger**: Earlier iterations of this proposal used filesystem watching to detect configuration changes. This was set aside in favour of decoupling the trigger from the apply operation, since the trigger mechanism has unresolved design questions (security, delivery method, Kubernetes integration) that should not block the core capability.
-- **Node-based failure policy (`onVirtualClusterStopped`)**: The original Proposal 016 design fired the serve policy when a VC *arrived at* the `Stopped` state. This conflates intentional removal (a success) with terminal failure (a problem). Replaced with edge-based policy that fires only on the `failed → stopped` transition.
-- **Single `onFailure: ROLLBACK | TERMINATE` knob**: The original reload design conflated two independent dimensions — orchestration rollback and terminal failure policy — into a single configuration option. Decomposed into `configurationReload.onFailure.rollback` (orchestration) and `onVirtualClusterTerminalFailure.serve` (lifecycle), which compose independently and reveal two additional meaningful behaviour combinations.
-- **`ReloadOptions` as a per-call parameter**: An approach where each call to `KafkaProxy.applyConfiguration()` could specify failure behaviour. Rejected because these decisions vary by deployment, not by invocation — they belong in static configuration.
+- **Node-based failure policy (`onVirtualClusterStopped`)**: The original Proposal 016 design fired the serve policy when a VC *arrived at* the `Stopped` state. This conflates intentional removal (a success) with terminal failure (a problem). The current design avoids this entirely by surfacing failures through `ConfigurationResult.errors()` and letting the caller decide blast radius.
+- **`onVirtualClusterTerminalFailure` / `configurationReload` YAML config blocks**: An earlier iteration proposed YAML-level deployment policy for "what to do when a VC fails" and "should reload roll back atomically." Rejected in favour of caller-side policy via `whenComplete`. The proxy reports outcomes; the caller chooses the response. This shrinks the proxy's API surface and lets different deployment scenarios (CLI, operator, sophisticated trigger) express different policies without proxy changes.
+- **`ReloadOptions` as a per-call parameter**: An approach where each call to `KafkaProxy.applyConfiguration()` could specify failure behaviour. Rejected because the caller can express any policy on the future returned by the method — a per-call parameter would not add expressive power and would commit the proxy to a specific failure-policy taxonomy.
+- **`VirtualClusterLifecycleObserver` injected at construction**: An earlier iteration proposed a push-based observer notified of every lifecycle transition. Rejected for this proposal in favour of the simpler `whenComplete` model, which covers the failure-handling use case without introducing a new extension point. A general-purpose lifecycle event stream (useful for control-plane status push) may be revisited in a follow-up proposal.
+- **Structured `ConfigurationError` (typed by failure layer)**: An earlier iteration proposed `ConfigurationError(String virtualClusterName, @Nullable String filterName, ReloadPhase phase, Throwable cause)`. The current minimal form (one identifier + cause) is intentional — committing to a phase enum or a structured-fields shape now would constrain the broader proxy-config rework. Programmatic consumers should use `cause` for typed handling; the identifier is for human consumption.
 - **`ConfigurationReconciler` naming**: Considered to describe the "compare desired vs current and converge" pattern, but rejected because Kubernetes reconcilers already exist in the Kroxylicious codebase and overloading the term would cause confusion.
 - **Plan/apply split on the public interface**: Considered exposing separate `plan()` and `apply()` methods to enable dry-run validation. Decided this is an internal concern — the trigger just needs `KafkaProxy.applyConfiguration()`. A validate/dry-run capability can be added later without changing the interface.
 - **Inline configuration via HTTP POST body**: Discussed having the HTTP endpoint accept the full YAML configuration in the request body. An alternative view is that configuration should always live in files (for source control, auditability, consistent state) and the HTTP endpoint should just trigger reading from a specified file path. This question is deferred along with the HTTP trigger design.
