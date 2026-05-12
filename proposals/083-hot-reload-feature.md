@@ -4,7 +4,7 @@
 
 This proposal introduces a mechanism for applying configuration changes to a running Kroxylicious proxy without a full restart. It defines a core `KafkaProxy.applyConfiguration(Configuration)` operation that accepts a complete configuration, detects what changed, and converges the running state to match — restarting only the affected virtual clusters while leaving unaffected clusters available.
 
-This proposal extends the virtual cluster lifecycle model (Proposal 016) with reload operations, an edge-based failure policy, and a configuration change orchestration layer. Where Proposal 016 defines the per-VC state machine and the `VirtualClusterManager` that owns it, this proposal defines the change detection pipeline, the reload orchestration, and the two policy layers (terminal failure and configuration failure) that govern how the proxy responds to problems during reload.
+This proposal extends the virtual cluster lifecycle model (Proposal 016) with reload operations, an edge-based failure policy, and a configuration change orchestration layer. Where Proposal 016 defines the per-VC state machine and the `VirtualClusterRegistry` that owns it, this proposal defines the change detection pipeline, the reload orchestration, and the two policy layers (terminal failure and configuration failure) that govern how the proxy responds to problems during reload.
 
 ## Current situation
 
@@ -196,7 +196,7 @@ When `KafkaProxy.applyConfiguration()` is called, the proxy compares the new con
 - **`VirtualClusterChangeDetector`** — identifies clusters that were added, removed, or modified by comparing `VirtualClusterModel` instances via `equals()`. A cluster requires a restart if any property that contributes to `VirtualClusterModel.equals()` changed (bootstrap address, TLS settings, gateway configuration, etc.).
 - **`FilterChangeDetector`** — identifies clusters affected by filter configuration changes. A cluster requires a restart if a `NamedFilterDefinition` it references changed (type or configuration, compared via `equals()`), or if the `defaultFilters` list changed (order matters, since filter chain execution is sequential) and the cluster relies on default filters.
 
-Detectors return a `ChangeResult(clustersToRemove, clustersToAdd, clustersToModify)`. Results from all detectors are aggregated and then passed onto `VirtualClusterManager` to perform relevant operations.
+Detectors return a `ChangeResult(clustersToRemove, clustersToAdd, clustersToModify)`. Results from all detectors are aggregated and then passed onto `VirtualClusterRegistry` to perform relevant operations.
 
 Clusters where none of these changed are left untouched — they continue serving traffic throughout the apply operation.
 
@@ -282,12 +282,12 @@ ConfigurationChangeHandler.handleConfigurationChange(context)
     │     FilterChangeDetector → VCs affected by filter changes
     │
     ├── Processes changes in order: Remove → Modify → Add
-    │     For each change: invoke the corresponding VirtualClusterManager
+    │     For each change: invoke the corresponding VirtualClusterRegistry
     │     method. Accumulate successes; collect failures as ConfigurationError
     │     entries.
     │
     ▼
-VirtualClusterManager (for each affected VC)
+VirtualClusterRegistry
     │
     ├── removeVirtualCluster:   SERVING → DRAINING → drain → deregister → STOPPED
     ├── restartVirtualCluster:  SERVING → DRAINING → drain → deregister → INITIALIZING → register → SERVING
@@ -428,5 +428,5 @@ Each of these can be designed and implemented independently once the core `Kafka
 - **`ConfigurationReconciler` naming**: Considered to describe the "compare desired vs current and converge" pattern, but rejected because Kubernetes reconcilers already exist in the Kroxylicious codebase and overloading the term would cause confusion.
 - **Plan/apply split on the public interface**: Considered exposing separate `plan()` and `apply()` methods to enable dry-run validation. Decided this is an internal concern — the trigger just needs `KafkaProxy.applyConfiguration()`. A validate/dry-run capability can be added later without changing the interface.
 - **Inline configuration via HTTP POST body**: Discussed having the HTTP endpoint accept the full YAML configuration in the request body. An alternative view is that configuration should always live in files (for source control, auditability, consistent state) and the HTTP endpoint should just trigger reading from a specified file path. This question is deferred along with the HTTP trigger design.
-- **Separate VirtualClusterManager for reload**: The original hot-reload design had a `VirtualClusterManager` that was purely an operation orchestrator (with `EndpointRegistry` and `ConnectionDrainManager` dependencies). Rather than maintaining two classes with the same name, the reload operations merge into the [Proposal 016](https://github.com/kroxylicious/design/blob/main/proposals/016-virtual-cluster-lifecycle.md) `VirtualClusterManager`, which already owns the VC model list and lifecycle managers. The merged class gains `EndpointRegistry` and `ConnectionDrainManager` dependencies and the `removeVirtualCluster`/`restartVirtualCluster`/`addVirtualCluster` methods.
+- **Separate VirtualClusterManager for reload**: The original hot-reload design had a `VirtualClusterManager` that was purely a reload orchestrator (with `EndpointRegistry` and `ConnectionDrainManager` dependencies). The reload operations instead merge into the [Proposal 016](https://github.com/kroxylicious/design/blob/main/proposals/016-virtual-cluster-lifecycle.md) `VirtualClusterRegistry`, which already owns the VC model list and lifecycle managers. The `VirtualClusterRegistry` gains `EndpointRegistry` and `ConnectionDrainManager` dependencies and the `removeVirtualCluster`/`restartVirtualCluster`/`addVirtualCluster` methods.
 - **Two terminal states (`Stopped` and `TerminallyFailed`)**: Considered adding a separate terminal state for unrecoverable failures. Rejected because the distinction is about the transition edge, not the terminal state — a stopped cluster is permanently done regardless of why. The edge-based policy hook achieves the same goal without adding state machine complexity.
