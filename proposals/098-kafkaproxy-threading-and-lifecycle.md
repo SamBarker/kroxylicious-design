@@ -1,4 +1,4 @@
-# 98 - Proposal 019: KafkaProxy Threading and Lifecycle Contract
+# 98 - KafkaProxy Threading and Lifecycle Contract
 
 ## Summary
 
@@ -10,7 +10,7 @@ Define the threading and lifecycle contract for `KafkaProxy`: it is a single-use
 
 - There is no documentation of which threads may call which methods.
 - The two-state boolean cannot distinguish "not yet started" from "stopped," so `startup()` after `shutdown()` silently succeeds in setting `running` back to `true` rather than being rejected.
-- The `block()` method checks `running.get()` but does not define what happens if called before `startup()` or after `shutdown()`. More fundamentally, `block()` exists as a separate method only because `startup()` returns `this` rather than a future — the caller has no other way to wait for shutdown. A `shutdown` `CompletableFuture` already exists internally and is what `block()` joins, but it is not surfaced to callers.
+- The `block()` method checks `running.get()` but does not define what happens if called before `startup()` or after `shutdown()`. More fundamentally, `block()` exists as a separate method only because `startup()` returns `this` rather than a future — the caller has no other way to wait for shutdown. A `shutdown` `CompletableFuture` already exists internally and is what `block()` joins, but it is not surfaced to callers. Since `KafkaProxy` is an internal class, `block()` can be removed entirely once `startup()` returns the future directly.
 - The `close()` method (from `AutoCloseable`) conditionally calls `shutdown()` based on `running.get()`, but the interaction between `close()` and explicit `shutdown()` calls is undocumented.
 
 The lack of a formal contract means that components within the proxy — such as the virtual cluster lifecycle state machine ([016](./016-virtual-cluster-lifecycle.md)) — cannot make informed decisions about their own concurrency models.
@@ -43,7 +43,7 @@ NEW  ──>  STARTING  ──>  STARTED  ──>  STOPPING  ──>  STOPPED
 - **STOPPING**: `shutdown()` is in progress. The caller may join the future returned by `startup()` to wait for completion.
 - **STOPPED**: terminal. All resources released.
 
-If `startup()` fails partway through, the proxy transitions directly to `STOPPED` — partially-acquired resources are released before returning a failed future. There is no `FAILED` state at the proxy level; a failed startup is simply a proxy that went straight to `STOPPED`. This is intentional for two reasons: the proxy is not reconfigurable, so there is no recovery transition from a hypothetical `FAILED` state (unlike virtual clusters, which support `failed` -> `initializing` for retry with corrected configuration); and the failure is communicated directly to the caller via the future's exceptional completion, so there is no need to hold the error in state for later inspection.
+If `startup()` fails partway through, the proxy transitions directly to `STOPPED` — partially-acquired resources are released before the startup future is failed exceptionally. There is no `FAILED` state at the proxy level; a failed startup is simply a proxy that went straight to `STOPPED`. This is intentional for two reasons: the proxy is not reconfigurable, so there is no recovery transition from a hypothetical `FAILED` state (unlike virtual clusters, which support `failed` -> `initializing` for retry with corrected configuration); and the failure is communicated directly to the caller via the future's exceptional completion, so there is no need to hold the error in state for later inspection.
 
 The lifecycle is **not restartable**. Once a proxy reaches `STOPPED`, it cannot return to any earlier state. To restart, create a new `KafkaProxy` instance. This holds across all deployment models: standalone and Kubernetes today, and sidecar or embedded library if those models are supported in the future.
 
@@ -73,7 +73,7 @@ The future has three terminal outcomes:
 
 Calling `cancel()` on the future is equivalent to calling `shutdown()` — it initiates a graceful shutdown. The `mayInterruptIfRunning` parameter is ignored; shutdown is always graceful regardless of its value.
 
-The existing `block()` method is deprecated and delegates to `join()` on the lifecycle future.
+The existing `block()` method is removed — it is an internal method with no external callers, and `join()` on the lifecycle future is a direct replacement.
 
 ### Threading Contract
 
@@ -125,7 +125,7 @@ These metrics are public API surface — once exposed, their names and semantics
 ## Affected/Not Affected Projects
 
 **Affected:**
-- **kroxylicious-proxy (runtime)**: `KafkaProxy` gains a formal lifecycle contract. `startup()` returns a `CompletableFuture<Void>`. `block()` is deprecated.
+- **kroxylicious-proxy (runtime)**: `KafkaProxy` gains a formal lifecycle contract. `startup()` returns a `CompletableFuture<Void>`. `block()` is removed.
 - **kroxylicious-proxy tests**: tests that exercise lifecycle edge cases (double-start, start-after-stop) should be added.
 
 **Not affected:**
