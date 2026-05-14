@@ -2,7 +2,7 @@
 
 ## Summary
 
-Define the threading and lifecycle contract for `KafkaProxy`: it is a single-use object with a linear lifecycle (`NEW` -> `STARTING` -> `STARTED` -> `STOPPING` -> `STOPPED`). `startup()` returns a single `CompletableFuture<Void>` representing the full proxy lifetime — it completes only when the proxy reaches `STOPPED`. Both `startup()` and `shutdown()` are idempotent — they may be called multiple times, but only one call performs the work.
+Define the threading and lifecycle contract for `KafkaProxy`: it is a single-use object with a linear lifecycle (`NEW` -> `STARTING` -> `STARTED` -> `STOPPING` -> `STOPPED`). `startup()` will always return the same `CompletableFuture<Void>` representing the full proxy lifetime — it completes only when the proxy reaches `STOPPED`. Both `startup()` and `shutdown()` are idempotent — they may be called multiple times, but only one call performs the work.
 
 ## Current Situation
 
