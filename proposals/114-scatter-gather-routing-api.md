@@ -1,4 +1,4 @@
-# 000 - A Scatter-Gather Routing API
+# 114 - A Scatter-Gather Routing API
 
 This proposal presents an alternative to [PR #70](https://github.com/kroxylicious/design/pull/70)
 for adding routing to Kroxylicious.
