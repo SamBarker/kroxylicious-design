@@ -7,7 +7,7 @@ To submit this proposal:
 5. Push changes
 -->
 
-# XXX - Rendered Install Manifests for GitOps Deployments
+# 115 - Rendered Install Manifests for GitOps Deployments
 
 Publish fully-rendered Kubernetes installation manifests as GitHub release assets to enable GitOps workflows and direct installation without downloading archives.
 
