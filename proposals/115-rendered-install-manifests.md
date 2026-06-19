@@ -42,7 +42,7 @@ This pattern enables one-command installation:
 kubectl apply -f https://github.com/project/releases/download/v1.0.0/install.yaml
 ```
 
-**GitOps integration:** Tools like Flux/Argo can track these URLs and automatically deploy/upgrade.
+**GitOps integration:** GitOps tools can reference these URLs directly in their configuration.
 
 ## Proposal
 
@@ -114,29 +114,15 @@ kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/
 kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
 ```
 
-**GitOps (Flux example):**
+**GitOps (Kustomize example):**
 ```yaml
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: GitRepository
-metadata:
-  name: kroxylicious-operator
-spec:
-  url: https://github.com/kroxylicious/kroxylicious
-  ref:
-    tag: v0.22.0
----
-apiVersion: kustomize.toolkit.fluxcd.io/v1
+apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-metadata:
-  name: kroxylicious-operator
-spec:
-  sourceRef:
-    kind: GitRepository
-    name: kroxylicious-operator
-  path: ./kroxylicious-operator-install-0.22.0.yaml
+resources:
+  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
 ```
 
-Or directly reference the release URL in a Kustomization remote resource.
+This Kustomization can be used with any GitOps tool that supports Kustomize (Flux CD, Argo CD, etc.).
 
 ### Signing
 
@@ -269,7 +255,7 @@ resources:
 ### Alternative 3: OCI Artifacts Only
 
 **Rejected because:**
-- Flux/Argo OCI support varies by version
+- OCI artifact support varies by GitOps tool and version
 - Less discoverable than GitHub release assets
 - Can be added later as complementary distribution
 - GitHub release URLs work universally
