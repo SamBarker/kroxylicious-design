@@ -181,7 +181,7 @@ Combined archives will be deprecated immediately in v0.22.0 and removed at the *
 | Release | Archive Status | Manifest Status | Notes |
 |---------|---------------|-----------------|-------|
 | v0.22.0 | ⚠️ **Deprecated** - Published with deprecation notice | ✅ **New** - Full support | Introduction release. Release notes highlight new manifests as recommended approach. |
-| v0.23.0 | ⚠️ **Deprecated** - Published with final warning | ✅ **Supported** | Release notes include final warning about removal. |
+| v0.23.0 | ⚠️ **Deprecated** - Published | ✅ **Supported** | Deprecation notice continues in release notes. |
 | v0.24.0 or v1.0.0 | ❌ **Removed** - No longer published | ✅ **Supported** | Archives removed at v1.0.0 milestone or v0.24.0, whichever comes first. |
 
 **What gets deprecated:**
