@@ -50,21 +50,25 @@ Publish the following artifacts as GitHub release assets for each release:
 
 ### Operator Artifacts
 
-| Artifact | Description | Use Case |
-|----------|-------------|----------|
-| `kroxylicious-operator-install-{version}.yaml` | Complete installation manifest (CRDs + operator resources) | Quick install, single-file GitOps reference |
-| `kroxylicious-operator-crds-{version}.yaml` | CRDs only | Separate CRD lifecycle management, cluster-admin pre-install |
-| `kroxylicious-operator-examples-{version}.tar.gz` | Example configurations (authorization, encryption, Strimzi integration, etc.) | Learning, testing, production templates |
-| `kroxylicious-operator-examples-{version}.zip` | Same as above, ZIP format | Windows users, alternative compression |
+All artifacts follow Maven classifier naming conventions (`artifactId-version-classifier.extension`):
+
+| Artifact | Maven Coordinates | Use Case |
+|----------|-------------------|----------|
+| `kroxylicious-operator-dist-{version}-install.yaml` | `io.kroxylicious:kroxylicious-operator-dist:install:yaml` | Complete installation (CRDs + operator), single-file GitOps reference |
+| `kroxylicious-operator-dist-{version}-crds.yaml` | `io.kroxylicious:kroxylicious-operator-dist:crds:yaml` | CRDs only for separate lifecycle management |
+| `kroxylicious-operator-dist-{version}-examples.tar.gz` | `io.kroxylicious:kroxylicious-operator-dist:examples:tar.gz` | Example configurations |
+| `kroxylicious-operator-dist-{version}-examples.zip` | `io.kroxylicious:kroxylicious-operator-dist:examples:zip` | Example configurations (ZIP) |
 
 ### Admission Webhook Artifacts
 
-| Artifact | Description | Use Case |
-|----------|-------------|----------|
-| `kroxylicious-admission-install-{version}.yaml` | Complete installation manifest (CRDs + webhook resources) | Quick install, single-file GitOps reference |
-| `kroxylicious-admission-crds-{version}.yaml` | CRDs only | Separate CRD lifecycle management |
-| `kroxylicious-admission-examples-{version}.tar.gz` | Example configurations (sidecar injection, cert-manager integration) | Learning, testing |
-| `kroxylicious-admission-examples-{version}.zip` | Same as above, ZIP format | Windows users |
+All artifacts follow Maven classifier naming conventions:
+
+| Artifact | Maven Coordinates | Use Case |
+|----------|-------------------|----------|
+| `kroxylicious-admission-dist-{version}-install.yaml` | `io.kroxylicious:kroxylicious-admission-dist:install:yaml` | Complete installation (CRDs + webhook) |
+| `kroxylicious-admission-dist-{version}-crds.yaml` | `io.kroxylicious:kroxylicious-admission-dist:crds:yaml` | CRDs only |
+| `kroxylicious-admission-dist-{version}-examples.tar.gz` | `io.kroxylicious:kroxylicious-admission-dist:examples:tar.gz` | Example configurations |
+| `kroxylicious-admission-dist-{version}-examples.zip` | `io.kroxylicious:kroxylicious-admission-dist:examples:zip` | Example configurations (ZIP) |
 
 ### Manifest Structure
 
@@ -102,16 +106,16 @@ No template markers remain in published manifests.
 
 **Single-step installation:**
 ```bash
-kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
+kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
 ```
 
 **Two-stage installation (CRDs first):**
 ```bash
 # Cluster-admin installs CRDs
-kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-crds-0.22.0.yaml
+kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-crds.yaml
 
 # Namespace-admin installs operator
-kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
+kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
 ```
 
 **GitOps (Kustomize example):**
@@ -119,14 +123,14 @@ kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
+  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
 ```
 
 This Kustomization can be used with any GitOps tool that supports Kustomize (Flux CD, Argo CD, etc.).
 
 ### Signing
 
-All YAML manifests are GPG-signed with corresponding `.asc` signature files, matching the existing pattern for archive artifacts.
+All artifacts (YAML manifests and archives) are automatically GPG-signed by `maven-gpg-plugin` during the Maven build as they are attached Maven artifacts. Corresponding `.asc` signature files are published alongside each artifact.
 
 ### Examples Separation
 
@@ -185,10 +189,10 @@ Examples move to dedicated archives separate from install manifests:
 - `kroxylicious-admission-{version}.zip` (combined install + examples)
 
 **What replaces them:**
-- `kroxylicious-operator-install-{version}.yaml` (install only, rendered)
-- `kroxylicious-operator-crds-{version}.yaml` (CRDs only, rendered)
-- `kroxylicious-operator-examples-{version}.tar.gz` (examples only)
-- `kroxylicious-operator-examples-{version}.zip` (examples only)
+- `kroxylicious-operator-dist-{version}-install.yaml` (install only, fully rendered)
+- `kroxylicious-operator-dist-{version}-crds.yaml` (CRDs only, fully rendered)
+- `kroxylicious-operator-dist-{version}-examples.tar.gz` (examples only)
+- `kroxylicious-operator-dist-{version}-examples.zip` (examples only)
 - Same for admission webhook
 
 **Migration guidance (documented in release notes and installation guide):**
@@ -210,10 +214,10 @@ kubectl apply -f .
 After (v0.22.0 and later):
 ```bash
 # Direct installation (no download/extract needed)
-kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
+kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
 
 # Download examples separately (only if needed)
-curl -L https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-examples-0.22.0.tar.gz | tar xz
+curl -L https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-examples.tar.gz | tar xz
 ```
 
 *For GitOps users:*
@@ -225,7 +229,7 @@ After: Direct reference to release URL:
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-install-0.22.0.yaml
+  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
 ```
 
 **Rationale for 3-release timeline:**
