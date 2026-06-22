@@ -13,32 +13,13 @@ Publish all-in-one Kubernetes installation manifests as GitHub release assets to
 
 ## Current situation
 
-Kroxylicious publishes Kubernetes operator and admission webhook as `.tar.gz` and `.zip` archives containing:
-- Installation manifests (multiple files in a directory)
-- Example configurations
-- Documentation
-
-Users must:
-1. Download the release archive
-2. Extract the contents
-3. Locate the install directory with manifests
-4. Manually commit these to their GitOps repositories
-5. Repeat this process for every release
-
-The archive format creates friction and is incompatible with GitOps tools (Flux CD, Argo CD) that expect to pull manifests directly from URLs or Git repositories.
+Kroxylicious publishes Kubernetes operator and admission webhook as `.tar.gz` and `.zip` archives containing installation manifests (multiple files in a directory), example configurations, and documentation.
 
 ## Motivation
 
-**Problem:** GitOps workflows cannot consume Kroxylicious operator/admission webhook releases. The current `.tar.gz`/`.zip` archive format requires users to:
-1. Download the release archive
-2. Extract the contents locally
-3. Locate the install manifests
-4. Manually commit these files to their GitOps repository
-5. Repeat this entire process for every release
+**Problem:** The archive format is incompatible with GitOps workflows. Users must download, extract, locate manifests, manually commit to their GitOps repository, and repeat for every release. GitOps tools (Flux CD, Argo CD) expect to pull manifests directly from URLs or Git repositories, not from archives.
 
-This manual workflow is fundamentally incompatible with GitOps tools (Flux CD, Argo CD) that expect to pull manifests directly from URLs or Git repositories.
-
-**User impact:** Teams using GitOps must maintain manual workarounds (downloading, extracting, committing rendered manifests), creating friction and delaying adoption. The problem cannot be worked around by referencing in-tree manifests because those contain unsubstituted template variables.
+**User impact:** Teams using GitOps must maintain manual workarounds, creating friction and delaying adoption.
 
 **Ecosystem precedent:** Projects like Strimzi and cert-manager solve this by publishing single-file install manifests as release assets:
 - Strimzi: `strimzi-cluster-operator-{version}.yaml`, `strimzi-crds-{version}.yaml`
