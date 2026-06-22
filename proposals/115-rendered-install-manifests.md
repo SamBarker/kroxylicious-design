@@ -174,13 +174,15 @@ Examples move to dedicated archives separate from install manifests:
 
 **Why deprecate archives:** Combined archives that include both install manifests and examples serve overlapping purposes with the new artifacts. Continuing to ship both creates confusion and maintenance burden.
 
-**Timeline (3-release deprecation):**
+**Timeline:**
+
+Combined archives will be deprecated immediately in v0.22.0 and removed at the **v1.0.0 milestone** (whichever comes first: v0.24.0 or v1.0.0).
 
 | Release | Archive Status | Manifest Status | Notes |
 |---------|---------------|-----------------|-------|
 | v0.22.0 | ⚠️ **Deprecated** - Published with deprecation notice | ✅ **New** - Full support | Introduction release. Release notes highlight new manifests as recommended approach. |
-| v0.23.0 | ⚠️ **Deprecated** - Published with final warning | ✅ **Supported** | Release notes include final warning: "Combined archives will be removed in v0.24.0" |
-| v0.24.0 | ❌ **Removed** - No longer published | ✅ **Supported** | Archives removed. Release notes document breaking change and migration path. |
+| v0.23.0 | ⚠️ **Deprecated** - Published with final warning | ✅ **Supported** | Release notes include final warning about removal. |
+| v0.24.0 or v1.0.0 | ❌ **Removed** - No longer published | ✅ **Supported** | Archives removed at v1.0.0 milestone or v0.24.0, whichever comes first. |
 
 **What gets deprecated:**
 - `kroxylicious-operator-{version}.tar.gz` (combined install + examples)
