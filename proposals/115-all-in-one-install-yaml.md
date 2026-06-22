@@ -14,18 +14,18 @@ Publish all-in-one Kubernetes installation manifests as GitHub release assets to
 ## Current situation
 
 Kroxylicious publishes Kubernetes operator and admission webhook as `.tar.gz` and `.zip` archives containing:
-- Installation manifests with unsubstituted template variables (e.g., `$[io.kroxylicious.operator.image.name]`)
+- Installation manifests (multiple files in a directory)
 - Example configurations
 - Documentation
 
 Users must:
 1. Download the release archive
 2. Extract the contents
-3. Locate the install directory with rendered manifests
+3. Locate the install directory with manifests
 4. Manually commit these to their GitOps repositories
 5. Repeat this process for every release
 
-This workflow is incompatible with GitOps tools (Flux CD, Argo CD) that pull manifests directly from Git or URLs.
+The archive format creates friction and is incompatible with GitOps tools (Flux CD, Argo CD) that expect to pull manifests directly from URLs or Git repositories.
 
 ## Motivation
 
