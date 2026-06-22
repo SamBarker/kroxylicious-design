@@ -7,9 +7,9 @@ To submit this proposal:
 5. Push changes
 -->
 
-# 115 - Rendered Install Manifests for GitOps Deployments
+# 115 - All-in-one Install YAML Manifests for GitOps
 
-Publish fully-rendered Kubernetes installation manifests as GitHub release assets to enable GitOps workflows and direct installation without downloading archives.
+Publish all-in-one Kubernetes installation manifests as GitHub release assets to enable GitOps workflows and direct installation without downloading archives.
 
 ## Current situation
 
