@@ -29,11 +29,18 @@ This workflow is incompatible with GitOps tools (Flux CD, Argo CD) that pull man
 
 ## Motivation
 
-**Problem:** GitOps tools cannot reference Kroxylicious install manifests directly from GitHub because the in-tree manifests contain unsubstituted variables.
+**Problem:** GitOps workflows cannot consume Kroxylicious operator/admission webhook releases. The current `.tar.gz`/`.zip` archive format requires users to:
+1. Download the release archive
+2. Extract the contents locally
+3. Locate the install manifests
+4. Manually commit these files to their GitOps repository
+5. Repeat this entire process for every release
 
-**User impact:** Teams using GitOps must maintain manual workarounds, creating friction and delaying adoption.
+This manual workflow is fundamentally incompatible with GitOps tools (Flux CD, Argo CD) that expect to pull manifests directly from URLs or Git repositories.
 
-**Ecosystem precedent:** Projects like Strimzi and cert-manager solve this by publishing single-file rendered manifests as release assets:
+**User impact:** Teams using GitOps must maintain manual workarounds (downloading, extracting, committing rendered manifests), creating friction and delaying adoption. The problem cannot be worked around by referencing in-tree manifests because those contain unsubstituted template variables.
+
+**Ecosystem precedent:** Projects like Strimzi and cert-manager solve this by publishing single-file install manifests as release assets:
 - Strimzi: `strimzi-cluster-operator-{version}.yaml`, `strimzi-crds-{version}.yaml`
 - cert-manager: `cert-manager.yaml`, `cert-manager.crds.yaml`
 
@@ -42,7 +49,7 @@ This pattern enables one-command installation:
 kubectl apply -f https://github.com/project/releases/download/v1.0.0/install.yaml
 ```
 
-**GitOps integration:** GitOps tools can reference these URLs directly in their configuration.
+**GitOps integration:** GitOps tools can reference these URLs directly in their configuration, enabling automated deployment and upgrades.
 
 ## Proposal
 
