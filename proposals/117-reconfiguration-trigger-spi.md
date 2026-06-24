@@ -28,7 +28,7 @@ The trigger SPI consists of three interfaces:
 
 - **`ReconfigurationTrigger`** — the trigger implementation itself, created by the factory, responsible for watching for configuration changes and calling `reconfigure()`.
 - **`ReconfigurationTriggerFactory`** — discovered via `ServiceLoader`, responsible for creating a `ReconfigurationTrigger` from its typed configuration.
-- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, source-agnostic configuration parsing, pre-flight validation, and the proxy's startup configuration path.
+- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, `shutdown()`, source-agnostic configuration parsing, pre-flight validation, and the proxy's startup configuration path.
 
 A proxy has at most one active trigger. Triggers are not composable (unlike filters in a chain). When no trigger is configured, the proxy operates as it does today — hot reload is not available.
 
@@ -138,10 +138,13 @@ public interface ReconfigurationTriggerFactory<C> {
  * trigger's view of the proxy — triggers never interact with
  * {@code KafkaProxy} directly.
  *
- * <p>The context provides three categories of capability:
+ * <p>The context provides four categories of capability:
  * <ul>
  *   <li><b>Reconfiguration</b> — {@link #reconfigure(Configuration)} drives
  *       the proxy to converge to a new configuration.</li>
+ *   <li><b>Proxy lifecycle</b> — {@link #shutdown()} initiates an orderly
+ *       proxy shutdown, enabling failure policies that terminate the proxy
+ *       on unrecoverable errors.</li>
  *   <li><b>Configuration handling</b> — {@link #parseConfiguration(InputStream)}
  *       and {@link #validateConfiguration(Configuration)} allow triggers to
  *       parse and pre-validate configuration from any source before applying
@@ -167,6 +170,20 @@ public interface ReconfigurationTriggerContext {
      *         exceptionally on catastrophic failure or input rejection
      */
     CompletableFuture<ReconfigureResult> reconfigure(Configuration newConfig);
+
+    /**
+     * Initiate an orderly shutdown of the proxy.
+     *
+     * <p>Triggers use this to implement failure policies that terminate the
+     * proxy on unrecoverable errors — for example, shutting down when
+     * {@code reconfigure()} returns non-empty {@code errors()}, or as a
+     * last resort when a rollback attempt itself fails.
+     *
+     * <p>This method returns immediately; the actual shutdown proceeds
+     * asynchronously. The trigger's {@link ReconfigurationTrigger#close()}
+     * method will be called as part of the shutdown sequence.
+     */
+    void shutdown();
 
     /**
      * Parse a YAML configuration stream into a {@link Configuration} object.
