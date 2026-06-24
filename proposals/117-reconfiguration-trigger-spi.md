@@ -28,7 +28,7 @@ The trigger SPI consists of three interfaces:
 
 - **`ReconfigurationTrigger`** — the trigger implementation itself, created by the factory, responsible for watching for configuration changes and calling `reconfigure()`.
 - **`ReconfigurationTriggerFactory`** — discovered via `ServiceLoader`, responsible for creating a `ReconfigurationTrigger` from its typed configuration.
-- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, `shutdown()`, source-agnostic configuration parsing, pre-flight validation, and the proxy's startup configuration path.
+- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, `shutdown()`, pre-flight validation, and the proxy's startup configuration path. Triggers provide configuration as a `Snapshot` (adopted from Proposal 096) — a source-agnostic abstraction that decouples the trigger from the configuration format.
 
 A proxy has at most one active trigger. Triggers are not composable (unlike filters in a chain). When no trigger is configured, the proxy operates as it does today — hot reload is not available.
 
@@ -37,7 +37,7 @@ A proxy has at most one active trigger. Triggers are not composable (unlike filt
 ```java
 /**
  * A reconfiguration trigger watches for configuration changes and drives
- * {@link ReconfigurationTriggerContext#reconfigure(Configuration)} when a
+ * {@link ReconfigurationTriggerContext#reconfigure(Snapshot)} when a
  * change is detected.
  *
  * <h2>Lifecycle</h2>
@@ -130,6 +130,14 @@ public interface ReconfigurationTriggerFactory<C> {
 }
 ```
 
+### `Snapshot`
+
+Triggers deliver configuration to the runtime as a `Snapshot` — a source-agnostic representation of the proxy's desired configuration state. This type is adopted from [Proposal 096 — Reworking proxy configuration](https://github.com/kroxylicious/design/pull/96), where it is described as an internal runtime abstraction. This proposal promotes `Snapshot` to public API so that triggers can produce configuration from any source without coupling to the configuration format.
+
+For the current single-file configuration model, a `Snapshot` wraps a single YAML string. When Proposal 096's multi-file configuration lands, the same `Snapshot` interface supports `proxy.yaml` + `plugins.d/` directory trees, Kubernetes-backed configurations, and in-memory representations — without any change to the trigger SPI.
+
+The `Snapshot` interface is defined in Proposal 096. This proposal does not redefine it; it adopts it as-is.
+
 ### `ReconfigurationTriggerContext`
 
 ```java
@@ -138,19 +146,18 @@ public interface ReconfigurationTriggerFactory<C> {
  * trigger's view of the proxy — triggers never interact with
  * {@code KafkaProxy} directly.
  *
- * <p>The context provides four categories of capability:
+ * <p>The context provides three categories of capability:
  * <ul>
- *   <li><b>Reconfiguration</b> — {@link #reconfigure(Configuration)} drives
- *       the proxy to converge to a new configuration.</li>
+ *   <li><b>Reconfiguration</b> — {@link #reconfigure(Snapshot)} drives
+ *       the proxy to converge to a new configuration. The trigger provides
+ *       a {@link Snapshot} representing the desired state; the runtime
+ *       handles parsing and change detection internally.</li>
  *   <li><b>Proxy lifecycle</b> — {@link #shutdown()} initiates an orderly
  *       proxy shutdown, enabling failure policies that terminate the proxy
  *       on unrecoverable errors.</li>
- *   <li><b>Configuration handling</b> — {@link #parseConfiguration(InputStream)}
- *       and {@link #validateConfiguration(Configuration)} allow triggers to
- *       parse and pre-validate configuration from any source before applying
- *       it.</li>
- *   <li><b>Startup context</b> — {@link #configFilePath()} provides the path
- *       the proxy was originally started with.</li>
+ *   <li><b>Validation</b> — {@link #validate(Snapshot)} allows triggers to
+ *       pre-validate a snapshot before applying it, catching structural and
+ *       scope errors before any virtual cluster experiences downtime.</li>
  * </ul>
  *
  * <p>The context is thread-safe. All methods may be called from any thread.
@@ -158,18 +165,18 @@ public interface ReconfigurationTriggerFactory<C> {
 public interface ReconfigurationTriggerContext {
 
     /**
-     * Apply a new configuration to the running proxy. Delegates to
-     * {@link KafkaProxy#reconfigure(Configuration)} — see that method's
-     * Javadoc (Proposal 083) for the full contract including error reporting,
-     * concurrency control, and scope limitations.
+     * Apply a new configuration to the running proxy. The runtime parses the
+     * snapshot, detects what changed, and converges the running state to match.
+     * See {@link KafkaProxy#reconfigure} (Proposal 083) for the full contract
+     * including error reporting, concurrency control, and scope limitations.
      *
-     * @param newConfig the desired end-state configuration; must be non-null
-     *                  and statically valid
+     * @param newConfig a snapshot representing the desired end-state
+     *                  configuration
      * @return a future that completes with a {@link ReconfigureResult}
      *         describing any per-component failures, or completes
      *         exceptionally on catastrophic failure or input rejection
      */
-    CompletableFuture<ReconfigureResult> reconfigure(Configuration newConfig);
+    CompletableFuture<ReconfigureResult> reconfigure(Snapshot newConfig);
 
     /**
      * Initiate an orderly shutdown of the proxy.
@@ -186,28 +193,11 @@ public interface ReconfigurationTriggerContext {
     void shutdown();
 
     /**
-     * Parse a YAML configuration stream into a {@link Configuration} object.
-     *
-     * <p>Uses the same parser and static validation rules that the proxy
-     * applies at startup, ensuring consistency regardless of how the trigger
-     * sources configuration. Triggers may obtain the stream from any source:
-     * a file ({@link java.nio.file.Files#newInputStream}), an HTTP request
-     * body, an in-memory buffer, etc.
-     *
-     * @param configurationYaml the YAML configuration as a stream
-     * @return the parsed and statically validated configuration
-     * @throws ConfigurationException if the stream cannot be read or contains
-     *         invalid configuration
-     */
-    Configuration parseConfiguration(InputStream configurationYaml);
-
-    /**
-     * Validate a {@link Configuration} against the proxy's current running
-     * state without applying it. Performs the same pre-flight checks that
-     * {@link #reconfigure(Configuration)} would perform before beginning
-     * any state-changing work — in particular, detecting out-of-scope
-     * changes that would cause {@code reconfigure()} to reject the
-     * configuration.
+     * Validate a snapshot against the proxy's current running state without
+     * applying it. Performs the same pre-flight checks that
+     * {@link #reconfigure(Snapshot)} would perform before beginning any
+     * state-changing work — parsing, static validation, and detection of
+     * out-of-scope changes.
      *
      * <p>A trigger can use this to implement a two-phase workflow:
      * validate first, then apply only if validation passes. This catches
@@ -216,26 +206,28 @@ public interface ReconfigurationTriggerContext {
      * <p>A successful validation does not guarantee that a subsequent
      * {@code reconfigure()} call will succeed — runtime conditions (port
      * availability, upstream reachability) may change between validation
-     * and application. But it does guarantee that the configuration will
-     * not be rejected for structural or scope reasons.
+     * and application. But it does guarantee that the snapshot will not be
+     * rejected for structural or scope reasons.
      *
-     * @param config the configuration to validate
+     * @param config the snapshot to validate
      * @throws OutOfScopeChangeException if the configuration differs from
      *         the running configuration in an out-of-scope section
-     * @throws ConfigurationException if the configuration fails validation
+     * @throws ConfigurationException if the snapshot cannot be parsed or
+     *         fails validation
      */
-    void validateConfiguration(Configuration config);
+    void validate(Snapshot config);
 
     /**
-     * Returns the path to the configuration file the proxy was started with.
+     * Returns the path to the configuration file (or directory) the proxy
+     * was started with.
      *
-     * <p>This is the file path that was passed to the proxy at startup. It
-     * does not change during the proxy's lifetime. Triggers may use it as a
-     * default watch target, as a baseline for change detection, or to locate
-     * configuration relative to the proxy's working directory. Triggers that
-     * source configuration from non-file origins may ignore it.
+     * <p>This is the path that was passed to the proxy at startup. It does
+     * not change during the proxy's lifetime. Triggers may use it as a
+     * default watch target, as a baseline for change detection, or to
+     * construct a new {@link Snapshot} from the same location. Triggers
+     * that source configuration from non-filesystem origins may ignore it.
      *
-     * @return the startup configuration file path
+     * @return the startup configuration path
      */
     Path configFilePath();
 }
@@ -264,11 +256,11 @@ Proposal 083 defined `KafkaProxy.reconfigure()` as a minimal operation that repo
 
 #### Configuration sourcing
 
-The trigger is responsible for obtaining and delivering a new `Configuration` to `reconfigure()`. How the configuration is sourced — watching a file, receiving an HTTP request, responding to a CRD reconciliation — is the trigger's concern. The `ReconfigurationTriggerContext` provides `parseConfiguration(InputStream)` so triggers can parse YAML from any source (file, HTTP body, in-memory buffer) using the same parser and validation rules the proxy applies at startup. Triggers may also construct `Configuration` objects programmatically if their source is not YAML.
+The trigger is responsible for obtaining and delivering a new `Snapshot` to `reconfigure()`. How the snapshot is produced — watching a filesystem directory, receiving an HTTP request, responding to a CRD reconciliation — is the trigger's concern. The `Snapshot` abstraction (adopted from Proposal 096) decouples the trigger from the configuration format: a file watcher produces a filesystem-backed snapshot, an operator produces a Kubernetes-backed snapshot, and so on. The runtime handles parsing and validation internally.
 
-#### Static validation
+#### Validation
 
-Static validation (schema conformance, required fields, field-value ranges, internal consistency) must be performed on the new configuration **before** calling `reconfigure()`. This is the caller's responsibility per Proposal 083's contract. `parseConfiguration(InputStream)` performs static validation as part of parsing. Triggers that construct `Configuration` objects directly must ensure equivalent validation. Additionally, `validateConfiguration(Configuration)` allows triggers to check for out-of-scope changes and other pre-flight failures before committing to a reconfiguration that would disrupt traffic — enabling a validate-then-apply workflow.
+Triggers can use `validate(Snapshot)` to pre-validate a snapshot before applying it. This performs the same pre-flight checks as `reconfigure()` — parsing, static validation, and out-of-scope change detection — without modifying any running state. This enables a validate-then-apply workflow that catches problems before any virtual cluster experiences downtime.
 
 #### Failure policy
 
@@ -282,7 +274,7 @@ The choice between these (or a custom policy) is the trigger's decision, typical
 
 #### Previous configuration tracking
 
-Triggers that support rollback must maintain their own record of the previous known-good configuration. The proxy does not expose a getter for its running configuration. Triggers typically have a natural source-of-truth for this: a previous file snapshot, a ConfigMap revision, an HTTP request history.
+Triggers that support rollback must maintain their own record of the previous known-good `Snapshot`. The proxy does not expose a getter for its running configuration. Triggers typically have a natural source-of-truth for this: a previous filesystem snapshot, a ConfigMap revision, an HTTP request history.
 
 #### Concurrency handling
 
@@ -391,10 +383,10 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
         watchThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
                 // wait for events, debounce, then:
-                try (InputStream in = Files.newInputStream(watchPath)) {
-                    Configuration newConfig = context.parseConfiguration(in);
-                    context.validateConfiguration(newConfig);
-                    context.reconfigure(newConfig)
+                try {
+                    Snapshot snapshot = Snapshot.fromPath(watchPath);
+                    context.validate(snapshot);
+                    context.reconfigure(snapshot)
                            .whenComplete((result, ex) -> {
                                if (ex instanceof ConcurrentReconfigureException) {
                                    // retry later
@@ -411,7 +403,7 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
                                }
                            });
                 } catch (ConfigurationException e) {
-                    LOG.error("Failed to parse or validate configuration", e);
+                    LOG.error("Failed to validate configuration", e);
                 }
             }
         });
@@ -429,8 +421,8 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
 
 This example demonstrates:
 - The trigger manages its own threads
-- `parseConfiguration(InputStream)` parses from any source — here a file, but equally an HTTP body or in-memory buffer
-- `validateConfiguration()` catches out-of-scope changes before any VC experiences downtime
+- The trigger produces a `Snapshot` from the filesystem — other triggers would produce snapshots from other sources
+- `validate()` catches structural and scope errors before any VC experiences downtime
 - `whenComplete()` implements failure policy (best-effort in this case)
 - `ConcurrentReconfigureException` is handled with retry semantics
 - The trigger uses `configFilePath()` as its default watch target
@@ -448,6 +440,7 @@ This example demonstrates:
 - **Proposal 083 unchanged.** The `KafkaProxy.reconfigure()` contract, `ReconfigureResult`, `ReconfigureError`, concurrency control, and scope limitations are unchanged.
 - **Configuration format.** The `reconfigurationTrigger` section is new; its absence is a no-op. Because it is an out-of-scope section for `reconfigure()`, any change to it in a new configuration will be rejected with `OutOfScopeChangeException` — which is the correct behaviour (trigger changes require a restart).
 - **Plugin convention.** The `type` + `config` pattern and `ServiceLoader` discovery follow established Kroxylicious conventions and do not introduce new mechanisms.
+- **Proposal 096 (configuration rework).** This proposal adopts Proposal 096's `Snapshot` abstraction as the type triggers provide to `reconfigure()`. For the current single-file configuration model, `Snapshot` wraps a single YAML string. When Proposal 096's multi-file configuration lands, triggers produce multi-file snapshots through the same interface — no trigger SPI changes required.
 
 ## Rejected alternatives
 
@@ -457,7 +450,7 @@ This example demonstrates:
 
 - **Multiple simultaneous triggers**: Considered allowing multiple triggers to be active (e.g. both a file watcher and an HTTP endpoint). Rejected because `reconfigure()` only allows one reconfiguration at a time (`ConcurrentReconfigureException`), and multiple triggers racing to reconfigure would create unpredictable behaviour. If a deployment needs both file-based and HTTP-based triggering, a single trigger implementation can support both input mechanisms internally.
 
-- **Trigger signals "config changed" without providing `Configuration`**: An alternative where the trigger simply signals "reload" and the runtime re-reads and parses the configuration file. Simpler for file-based triggers but does not support non-file configuration sources (HTTP request bodies, CRD specs, programmatically generated configuration). The `parseConfiguration(InputStream)` method on `ReconfigurationTriggerContext` gives file-based triggers the same simplicity (open a stream, call parse) while preserving flexibility for other sources.
+- **Trigger signals "config changed" without providing a `Snapshot`**: An alternative where the trigger simply signals "reload" and the runtime re-reads the configuration from its startup path. Simpler for the file watcher case but does not support non-filesystem configuration sources (HTTP request bodies, CRD specs, in-memory representations). The `Snapshot` abstraction gives file-based triggers comparable simplicity (`Snapshot.fromPath(...)`) while supporting any source.
 
 - **Hardcoded trigger in `kroxylicious-app`**: Instead of an SPI, wire a file watcher directly into the standalone binary. Rejected because it forces users who need a different trigger mechanism (HTTP, custom control plane) to embed the proxy rather than just providing a different trigger on the classpath. The SPI cost is small and the extensibility value is high.
 
