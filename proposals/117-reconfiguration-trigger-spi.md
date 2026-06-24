@@ -1,4 +1,4 @@
-# 000 - Reconfiguration Trigger SPI
+# 117 - Reconfiguration Trigger SPI
 
 **Builds on:** [Proposal 083 — Changing Active Proxy Configuration](https://github.com/kroxylicious/design/blob/main/proposals/083-hot-reload-feature.md)
 
