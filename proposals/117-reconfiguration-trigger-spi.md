@@ -28,7 +28,7 @@ The trigger SPI consists of three interfaces:
 
 - **`ReconfigurationTrigger`** — the trigger implementation itself, created by the factory, responsible for watching for configuration changes and calling `reconfigure()`.
 - **`ReconfigurationTriggerFactory`** — discovered via `ServiceLoader`, responsible for creating a `ReconfigurationTrigger` from its typed configuration.
-- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()` and configuration parsing utilities.
+- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, source-agnostic configuration parsing, pre-flight validation, and the proxy's startup configuration path.
 
 A proxy has at most one active trigger. Triggers are not composable (unlike filters in a chain). When no trigger is configured, the proxy operates as it does today — hot reload is not available.
 
@@ -138,13 +138,16 @@ public interface ReconfigurationTriggerFactory<C> {
  * trigger's view of the proxy — triggers never interact with
  * {@code KafkaProxy} directly.
  *
- * <p>The context provides two categories of capability:
+ * <p>The context provides three categories of capability:
  * <ul>
  *   <li><b>Reconfiguration</b> — {@link #reconfigure(Configuration)} drives
  *       the proxy to converge to a new configuration.</li>
- *   <li><b>Configuration parsing</b> — {@link #parseConfiguration(Path)}
- *       provides a convenience for file-based triggers that need to convert
- *       a YAML file into a {@link Configuration} object.</li>
+ *   <li><b>Configuration handling</b> — {@link #parseConfiguration(InputStream)}
+ *       and {@link #validateConfiguration(Configuration)} allow triggers to
+ *       parse and pre-validate configuration from any source before applying
+ *       it.</li>
+ *   <li><b>Startup context</b> — {@link #configFilePath()} provides the path
+ *       the proxy was originally started with.</li>
  * </ul>
  *
  * <p>The context is thread-safe. All methods may be called from any thread.
@@ -166,27 +169,54 @@ public interface ReconfigurationTriggerContext {
     CompletableFuture<ReconfigureResult> reconfigure(Configuration newConfig);
 
     /**
-     * Parse a YAML configuration file into a {@link Configuration} object.
+     * Parse a YAML configuration stream into a {@link Configuration} object.
      *
-     * <p>This is a convenience method for file-based triggers. It performs
-     * the same parsing and static validation that the proxy performs at
-     * startup. Triggers that source configuration from non-file sources
-     * (e.g. an HTTP request body, a CRD spec) may construct
-     * {@link Configuration} objects directly instead.
+     * <p>Uses the same parser and static validation rules that the proxy
+     * applies at startup, ensuring consistency regardless of how the trigger
+     * sources configuration. Triggers may obtain the stream from any source:
+     * a file ({@link java.nio.file.Files#newInputStream}), an HTTP request
+     * body, an in-memory buffer, etc.
      *
-     * @param configFile path to the YAML configuration file
-     * @return the parsed configuration
-     * @throws ConfigurationException if the file cannot be read or contains
+     * @param configurationYaml the YAML configuration as a stream
+     * @return the parsed and statically validated configuration
+     * @throws ConfigurationException if the stream cannot be read or contains
      *         invalid configuration
      */
-    Configuration parseConfiguration(Path configFile);
+    Configuration parseConfiguration(InputStream configurationYaml);
+
+    /**
+     * Validate a {@link Configuration} against the proxy's current running
+     * state without applying it. Performs the same pre-flight checks that
+     * {@link #reconfigure(Configuration)} would perform before beginning
+     * any state-changing work — in particular, detecting out-of-scope
+     * changes that would cause {@code reconfigure()} to reject the
+     * configuration.
+     *
+     * <p>A trigger can use this to implement a two-phase workflow:
+     * validate first, then apply only if validation passes. This catches
+     * problems before any virtual cluster experiences downtime.
+     *
+     * <p>A successful validation does not guarantee that a subsequent
+     * {@code reconfigure()} call will succeed — runtime conditions (port
+     * availability, upstream reachability) may change between validation
+     * and application. But it does guarantee that the configuration will
+     * not be rejected for structural or scope reasons.
+     *
+     * @param config the configuration to validate
+     * @throws OutOfScopeChangeException if the configuration differs from
+     *         the running configuration in an out-of-scope section
+     * @throws ConfigurationException if the configuration fails validation
+     */
+    void validateConfiguration(Configuration config);
 
     /**
      * Returns the path to the configuration file the proxy was started with.
      *
-     * <p>File-based triggers typically watch this path for changes. The path
-     * is the same one passed to the proxy at startup and does not change
-     * during the proxy's lifetime.
+     * <p>This is the file path that was passed to the proxy at startup. It
+     * does not change during the proxy's lifetime. Triggers may use it as a
+     * default watch target, as a baseline for change detection, or to locate
+     * configuration relative to the proxy's working directory. Triggers that
+     * source configuration from non-file origins may ignore it.
      *
      * @return the startup configuration file path
      */
@@ -217,11 +247,11 @@ Proposal 083 defined `KafkaProxy.reconfigure()` as a minimal operation that repo
 
 #### Configuration sourcing
 
-The trigger is responsible for obtaining and delivering a new `Configuration` to `reconfigure()`. How the configuration is sourced — watching a file, receiving an HTTP request, responding to a CRD reconciliation — is the trigger's concern. The `ReconfigurationTriggerContext` provides `parseConfiguration(Path)` as a convenience for file-based triggers, but triggers may construct `Configuration` objects from any source.
+The trigger is responsible for obtaining and delivering a new `Configuration` to `reconfigure()`. How the configuration is sourced — watching a file, receiving an HTTP request, responding to a CRD reconciliation — is the trigger's concern. The `ReconfigurationTriggerContext` provides `parseConfiguration(InputStream)` so triggers can parse YAML from any source (file, HTTP body, in-memory buffer) using the same parser and validation rules the proxy applies at startup. Triggers may also construct `Configuration` objects programmatically if their source is not YAML.
 
 #### Static validation
 
-Static validation (schema conformance, required fields, field-value ranges, internal consistency) must be performed on the new configuration **before** calling `reconfigure()`. This is the caller's responsibility per Proposal 083's contract. `parseConfiguration(Path)` performs static validation as part of parsing; triggers that construct `Configuration` objects directly must ensure equivalent validation.
+Static validation (schema conformance, required fields, field-value ranges, internal consistency) must be performed on the new configuration **before** calling `reconfigure()`. This is the caller's responsibility per Proposal 083's contract. `parseConfiguration(InputStream)` performs static validation as part of parsing. Triggers that construct `Configuration` objects directly must ensure equivalent validation. Additionally, `validateConfiguration(Configuration)` allows triggers to check for out-of-scope changes and other pre-flight failures before committing to a reconfiguration that would disrupt traffic — enabling a validate-then-apply workflow.
 
 #### Failure policy
 
@@ -344,8 +374,9 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
         watchThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
                 // wait for events, debounce, then:
-                try {
-                    Configuration newConfig = context.parseConfiguration(watchPath);
+                try (InputStream in = Files.newInputStream(watchPath)) {
+                    Configuration newConfig = context.parseConfiguration(in);
+                    context.validateConfiguration(newConfig);
                     context.reconfigure(newConfig)
                            .whenComplete((result, ex) -> {
                                if (ex instanceof ConcurrentReconfigureException) {
@@ -363,7 +394,7 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
                                }
                            });
                 } catch (ConfigurationException e) {
-                    LOG.error("Failed to parse configuration", e);
+                    LOG.error("Failed to parse or validate configuration", e);
                 }
             }
         });
@@ -381,10 +412,11 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
 
 This example demonstrates:
 - The trigger manages its own threads
-- `parseConfiguration()` provides file parsing without reimplementation
+- `parseConfiguration(InputStream)` parses from any source — here a file, but equally an HTTP body or in-memory buffer
+- `validateConfiguration()` catches out-of-scope changes before any VC experiences downtime
 - `whenComplete()` implements failure policy (best-effort in this case)
 - `ConcurrentReconfigureException` is handled with retry semantics
-- The trigger watches `configFilePath()` by default
+- The trigger uses `configFilePath()` as its default watch target
 
 ## Affected projects
 
@@ -408,7 +440,7 @@ This example demonstrates:
 
 - **Multiple simultaneous triggers**: Considered allowing multiple triggers to be active (e.g. both a file watcher and an HTTP endpoint). Rejected because `reconfigure()` only allows one reconfiguration at a time (`ConcurrentReconfigureException`), and multiple triggers racing to reconfigure would create unpredictable behaviour. If a deployment needs both file-based and HTTP-based triggering, a single trigger implementation can support both input mechanisms internally.
 
-- **Trigger signals "config changed" without providing `Configuration`**: An alternative where the trigger simply signals "reload" and the runtime re-reads and parses the configuration file. Simpler for file-based triggers but does not support non-file configuration sources (HTTP request bodies, CRD specs, programmatically generated configuration). The `parseConfiguration(Path)` convenience method on `ReconfigurationTriggerContext` gives file-based triggers the same simplicity while preserving flexibility.
+- **Trigger signals "config changed" without providing `Configuration`**: An alternative where the trigger simply signals "reload" and the runtime re-reads and parses the configuration file. Simpler for file-based triggers but does not support non-file configuration sources (HTTP request bodies, CRD specs, programmatically generated configuration). The `parseConfiguration(InputStream)` method on `ReconfigurationTriggerContext` gives file-based triggers the same simplicity (open a stream, call parse) while preserving flexibility for other sources.
 
 - **Hardcoded trigger in `kroxylicious-app`**: Instead of an SPI, wire a file watcher directly into the standalone binary. Rejected because it forces users who need a different trigger mechanism (HTTP, custom control plane) to embed the proxy rather than just providing a different trigger on the classpath. The SPI cost is small and the extensibility value is high.
 
