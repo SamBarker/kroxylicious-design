@@ -2,7 +2,7 @@
 
 **Builds on:** [Proposal 083 — Changing Active Proxy Configuration](https://github.com/kroxylicious/design/blob/main/proposals/083-hot-reload-feature.md)
 
-This proposal defines a pluggable Service Provider Interface (SPI) for triggering `KafkaProxy.reconfigure()`. Trigger implementations are discovered via `ServiceLoader`, configured in the proxy's YAML configuration, and are responsible for sourcing new configuration and driving the reconfiguration lifecycle. The SPI formalises the trigger responsibilities established during the design of Proposal 083 and provides the extension point that allows different deployment models — standalone, Kubernetes, embedded — to use different reconfiguration strategies without proxy changes.
+This proposal defines a pluggable Service Provider Interface (SPI) for triggering `KafkaProxy.reconfigure()`. Trigger implementations are discovered via `ServiceLoader`, configured in the proxy's bootstrap configuration, and are the sole source of reloadable configuration — including the initial load at startup. The proposal introduces a logical split between **bootstrap configuration** (static settings read once at startup) and **reloadable configuration** (virtual clusters, filters, and plugins delivered via `Snapshot`). The SPI formalises the trigger responsibilities established during the design of Proposal 083 and provides the extension point that allows different deployment models — standalone, Kubernetes, embedded — to use different reconfiguration strategies without proxy changes.
 
 ## Current situation
 
@@ -28,7 +28,7 @@ The trigger SPI consists of three interfaces:
 
 - **`ReconfigurationTrigger`** — the trigger implementation itself, created by the factory, responsible for watching for configuration changes and calling `reconfigure()`.
 - **`ReconfigurationTriggerFactory`** — discovered via `ServiceLoader`, responsible for creating a `ReconfigurationTrigger` from its typed configuration.
-- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, `shutdown()`, pre-flight validation, and the proxy's startup configuration path. Triggers provide configuration as a `Snapshot` (adopted from Proposal 096) — a source-agnostic abstraction that decouples the trigger from the configuration format.
+- **`ReconfigurationTriggerContext`** — provided by the runtime, gives the trigger access to `reconfigure()`, `shutdown()`, and pre-flight validation. Triggers provide configuration as a `Snapshot` (adopted from Proposal 096) — a source-agnostic representation of the reloadable state that decouples the trigger from the configuration format.
 
 A proxy has at most one active trigger. Triggers are not composable (unlike filters in a chain). When no trigger is configured, the proxy operates as it does today — hot reload is not available.
 
@@ -36,9 +36,10 @@ A proxy has at most one active trigger. Triggers are not composable (unlike filt
 
 ```java
 /**
- * A reconfiguration trigger watches for configuration changes and drives
- * {@link ReconfigurationTriggerContext#reconfigure(Snapshot)} when a
- * change is detected.
+ * A reconfiguration trigger is the sole source of reloadable configuration
+ * for the proxy. It performs the initial configuration load and then watches
+ * for subsequent changes, driving
+ * {@link ReconfigurationTriggerContext#reconfigure(Snapshot)} in both cases.
  *
  * <h2>Lifecycle</h2>
  * <p>A trigger instance is created by its {@link ReconfigurationTriggerFactory}
@@ -46,8 +47,12 @@ A proxy has at most one active trigger. Triggers are not composable (unlike filt
  * for the lifetime of the proxy process.
  *
  * <ul>
- *   <li>{@link #start()} is called after the proxy has completed startup and
- *       is serving traffic. The trigger should begin watching for changes.</li>
+ *   <li>{@link #start()} is called after the proxy has completed its bootstrap
+ *       (management endpoints, metrics) but before any virtual clusters exist.
+ *       The trigger must perform the initial configuration load — reading its
+ *       source, constructing a {@link Snapshot}, and calling
+ *       {@link ReconfigurationTriggerContext#reconfigure(Snapshot)} — before
+ *       setting up background watching for subsequent changes.</li>
  *   <li>{@link #close()} is called before proxy shutdown begins. The trigger
  *       should stop watching, release resources, and return promptly. Any
  *       in-flight {@code reconfigure()} call will complete independently.</li>
@@ -55,9 +60,10 @@ A proxy has at most one active trigger. Triggers are not composable (unlike filt
  *
  * <h2>Threading</h2>
  * <p>{@code start()} and {@code close()} are called on the proxy's main thread.
- * The trigger is free to create its own threads (e.g. a file watcher thread, an
- * HTTP server thread) but must manage their lifecycle. {@code reconfigure()} is
- * thread-safe and may be called from any thread.
+ * The initial configuration load within {@code start()} happens synchronously
+ * on the calling thread. Subsequent change detection (file watching, HTTP
+ * listening) should happen on background threads managed by the trigger.
+ * {@code reconfigure()} is thread-safe and may be called from any thread.
  *
  * <h2>Trigger responsibilities</h2>
  * <p>See the "Trigger responsibilities" section of this proposal for the full
@@ -66,17 +72,25 @@ A proxy has at most one active trigger. Triggers are not composable (unlike filt
 public interface ReconfigurationTrigger extends Closeable {
 
     /**
-     * Start watching for configuration changes.
+     * Perform the initial configuration load and begin watching for changes.
      *
-     * <p>Called once, after the proxy has completed startup. The trigger should
-     * begin watching for changes and call
-     * {@link ReconfigurationTriggerContext#reconfigure(Configuration)} when a
-     * change is detected. This method should return promptly — long-running
-     * work (file watching, HTTP listening) should happen on background threads
-     * managed by the trigger.
+     * <p>Called once, after the proxy has completed its bootstrap. The proxy
+     * has no virtual clusters at this point — the trigger must load the
+     * current configuration from its source, construct a {@link Snapshot},
+     * and call {@link ReconfigurationTriggerContext#reconfigure(Snapshot)}
+     * to bring virtual clusters to life. Only after the initial load
+     * succeeds should the trigger set up background watching for subsequent
+     * changes.
      *
-     * @throws Exception if the trigger cannot start (e.g. cannot open a watch
-     *         on the configuration file, cannot bind an HTTP port)
+     * <p>The initial load is synchronous: this method should not return
+     * until the first {@code reconfigure()} call has completed. Background
+     * watching for subsequent changes should be set up before returning.
+     *
+     * @throws Exception if the trigger cannot start (e.g. cannot read the
+     *         configuration source, cannot open a watch on the configuration
+     *         file, cannot bind an HTTP port). If this method throws, the
+     *         proxy will exit — an empty proxy with no virtual clusters is
+     *         not useful.
      */
     void start() throws Exception;
 
@@ -97,7 +111,7 @@ public interface ReconfigurationTrigger extends Closeable {
  *
  * <p>Each factory declares the type of its configuration object via
  * {@link #configType()}. The runtime deserialises the trigger-specific
- * configuration from the proxy's YAML configuration and passes it to
+ * configuration from the proxy's bootstrap configuration and passes it to
  * {@link #create(ReconfigurationTriggerContext, Object)}.
  *
  * @param <C> the trigger-specific configuration type. Must be deserializable
@@ -122,7 +136,7 @@ public interface ReconfigurationTriggerFactory<C> {
     /**
      * Returns the type of the trigger-specific configuration object.
      * The runtime uses this to deserialize the {@code config:} section of the
-     * trigger's YAML configuration block.
+     * trigger's bootstrap configuration block.
      *
      * @return the configuration class
      */
@@ -132,9 +146,11 @@ public interface ReconfigurationTriggerFactory<C> {
 
 ### `Snapshot`
 
-Triggers deliver configuration to the runtime as a `Snapshot` — a source-agnostic representation of the proxy's desired configuration state. This type is adopted from [Proposal 096 — Reworking proxy configuration](https://github.com/kroxylicious/design/pull/96), where it is described as an internal runtime abstraction. This proposal promotes `Snapshot` to public API so that triggers can produce configuration from any source without coupling to the configuration format.
+Triggers deliver configuration to the runtime as a `Snapshot` — a source-agnostic representation of the proxy's desired **reloadable** state (virtual clusters, filters, plugin instances). A `Snapshot` does not include bootstrap configuration (management, metrics, trigger settings) — that is read once at startup from the bootstrap file and is not the trigger's concern.
 
-For the current single-file configuration model, a `Snapshot` wraps a single YAML string. When Proposal 096's multi-file configuration lands, the same `Snapshot` interface supports `proxy.yaml` + `plugins.d/` directory trees, Kubernetes-backed configurations, and in-memory representations — without any change to the trigger SPI.
+The `Snapshot` type is adopted from [Proposal 096 — Reworking proxy configuration](https://github.com/kroxylicious/design/pull/96), where it is described as an internal runtime abstraction. This proposal promotes `Snapshot` to public API so that triggers can produce configuration from any source without coupling to the configuration format.
+
+For the current configuration model, a `Snapshot` wraps the reloadable portions of the proxy's YAML. As the configuration format evolves, the same `Snapshot` interface can support richer representations — multi-file layouts, Kubernetes-backed configurations, in-memory representations — without any change to the trigger SPI.
 
 The `Snapshot` interface is defined in Proposal 096. This proposal does not redefine it; it adopts it as-is.
 
@@ -150,14 +166,14 @@ The `Snapshot` interface is defined in Proposal 096. This proposal does not rede
  * <ul>
  *   <li><b>Reconfiguration</b> — {@link #reconfigure(Snapshot)} drives
  *       the proxy to converge to a new configuration. The trigger provides
- *       a {@link Snapshot} representing the desired state; the runtime
- *       handles parsing and change detection internally.</li>
+ *       a {@link Snapshot} representing the desired reloadable state; the
+ *       runtime handles parsing and change detection internally.</li>
  *   <li><b>Proxy lifecycle</b> — {@link #shutdown()} initiates an orderly
  *       proxy shutdown, enabling failure policies that terminate the proxy
  *       on unrecoverable errors.</li>
  *   <li><b>Validation</b> — {@link #validate(Snapshot)} allows triggers to
- *       pre-validate a snapshot before applying it, catching structural and
- *       scope errors before any virtual cluster experiences downtime.</li>
+ *       pre-validate a snapshot before applying it, catching structural
+ *       errors before any virtual cluster experiences downtime.</li>
  * </ul>
  *
  * <p>The context is thread-safe. All methods may be called from any thread.
@@ -168,10 +184,15 @@ public interface ReconfigurationTriggerContext {
      * Apply a new configuration to the running proxy. The runtime parses the
      * snapshot, detects what changed, and converges the running state to match.
      * See {@link KafkaProxy#reconfigure} (Proposal 083) for the full contract
-     * including error reporting, concurrency control, and scope limitations.
+     * including error reporting and concurrency control.
      *
-     * @param newConfig a snapshot representing the desired end-state
-     *                  configuration
+     * <p>This method handles both the initial load (when no virtual clusters
+     * exist) and subsequent reconfigurations. The trigger calls it in both
+     * cases — the runtime handles the "from nothing to something" case
+     * naturally.
+     *
+     * @param newConfig a snapshot representing the desired reloadable
+     *                  configuration (virtual clusters, filters, plugins)
      * @return a future that completes with a {@link ReconfigureResult}
      *         describing any per-component failures, or completes
      *         exceptionally on catastrophic failure or input rejection
@@ -193,11 +214,9 @@ public interface ReconfigurationTriggerContext {
     void shutdown();
 
     /**
-     * Validate a snapshot against the proxy's current running state without
-     * applying it. Performs the same pre-flight checks that
-     * {@link #reconfigure(Snapshot)} would perform before beginning any
-     * state-changing work — parsing, static validation, and detection of
-     * out-of-scope changes.
+     * Validate a snapshot without applying it. Performs the same pre-flight
+     * checks that {@link #reconfigure(Snapshot)} would perform before
+     * beginning any state-changing work — parsing and static validation.
      *
      * <p>A trigger can use this to implement a two-phase workflow:
      * validate first, then apply only if validation passes. This catches
@@ -207,25 +226,21 @@ public interface ReconfigurationTriggerContext {
      * {@code reconfigure()} call will succeed — runtime conditions (port
      * availability, upstream reachability) may change between validation
      * and application. But it does guarantee that the snapshot will not be
-     * rejected for structural or scope reasons.
+     * rejected for structural reasons.
      *
      * @param config the snapshot to validate
-     * @throws OutOfScopeChangeException if the configuration differs from
-     *         the running configuration in an out-of-scope section
      * @throws ConfigurationException if the snapshot cannot be parsed or
      *         fails validation
      */
     void validate(Snapshot config);
 
     /**
-     * Returns the path to the configuration file (or directory) the proxy
-     * was started with.
+     * Returns the path that was passed to the proxy at startup.
      *
-     * <p>This is the path that was passed to the proxy at startup. It does
-     * not change during the proxy's lifetime. Triggers may use it as a
-     * default watch target, as a baseline for change detection, or to
-     * construct a new {@link Snapshot} from the same location. Triggers
-     * that source configuration from non-filesystem origins may ignore it.
+     * <p>This path does not change during the proxy's lifetime. File-based
+     * triggers may use it as a default location for their configuration
+     * source. Triggers that source configuration from non-filesystem
+     * origins may ignore it.
      *
      * @return the startup configuration path
      */
@@ -233,22 +248,30 @@ public interface ReconfigurationTriggerContext {
 }
 ```
 
-### Configuration model
+### Bootstrap and reloadable configuration
 
-Triggers are selected and configured via a top-level `reconfigurationTrigger` section in the proxy's YAML configuration:
+This proposal introduces a logical split in proxy configuration:
+
+- **Bootstrap configuration** — static settings read once at startup: management endpoints, metrics, admin, and the trigger selection and configuration. These cannot change without a process restart.
+
+- **Reloadable configuration** — virtual clusters, filters, and plugin instances. This is the configuration that changes at runtime. It is always delivered as a `Snapshot` via `reconfigure()`, and the trigger is the sole source — including for the initial load at startup.
+
+This split formalises what Proposal 083 established implicitly: `reconfigure()` only applies virtual-cluster and filter configuration, and rejects changes to management, metrics, or admin sections. Rather than detecting out-of-scope changes in a monolithic configuration and rejecting them, the split separates the concerns logically. Snapshots contain only reloadable state, so there is nothing out-of-scope to detect.
+
+How the logical split manifests on disk — whether bootstrap and reloadable configuration live in the same file, separate files, or separate directories — is a configuration format concern outside the scope of this proposal. What matters for the trigger SPI is the contract: the trigger produces `Snapshot` objects containing reloadable state, and the runtime handles bootstrap configuration independently.
+
+The trigger is selected and configured within the bootstrap configuration. This follows the same `type` + `config` pattern used by filters, routers, and other Kroxylicious plugins:
 
 ```yaml
 reconfigurationTrigger:
-  type: FileWatcher                   # ServiceLoader type name
-  config:                             # trigger-specific configuration
-    debounceInterval: PT1S            # implementation-specific settings
+  type: FileWatcher
+  config:
+    debounceInterval: PT1S
 ```
 
-This follows the same `type` + `config` pattern used by filters, routers, and other Kroxylicious plugins.
+When the `reconfigurationTrigger` section is absent, no trigger is created and the proxy operates as today — configuration is loaded at startup and changes require a restart.
 
-When the `reconfigurationTrigger` section is absent, no trigger is created and the proxy operates as today — configuration changes require a restart.
-
-The `reconfigurationTrigger` section is **static configuration**: it is not hot-reloadable. Changing the trigger type or its configuration requires a proxy restart. This is consistent with Proposal 083's scope limitations — `reconfigure()` applies only virtual-cluster and filter configuration; other sections (including the trigger section) are out of scope and will cause `reconfigure()` to reject the configuration with `OutOfScopeChangeException` if they differ.
+The bootstrap/reloadable split has a direct consequence for the trigger lifecycle: because the trigger is the sole source of reloadable configuration, the proxy starts in an **empty state** — bootstrap infrastructure (management endpoints, metrics) is running but no virtual clusters exist. The trigger's first `reconfigure()` call brings up the virtual clusters. This is described in detail in the [Trigger lifecycle](#trigger-lifecycle) section.
 
 ### Trigger responsibilities
 
@@ -260,13 +283,13 @@ The trigger is responsible for obtaining and delivering a new `Snapshot` to `rec
 
 #### Validation
 
-Triggers can use `validate(Snapshot)` to pre-validate a snapshot before applying it. This performs the same pre-flight checks as `reconfigure()` — parsing, static validation, and out-of-scope change detection — without modifying any running state. This enables a validate-then-apply workflow that catches problems before any virtual cluster experiences downtime.
+Triggers can use `validate(Snapshot)` to pre-validate a snapshot before applying it. This performs the same pre-flight checks as `reconfigure()` — parsing and static validation — without modifying any running state. This enables a validate-then-apply workflow that catches problems before any virtual cluster experiences downtime.
 
 #### Failure policy
 
 The proxy does not act on `ReconfigureResult.errors()`. The trigger expresses its failure policy via `whenComplete()` on the returned future. Three canonical patterns are defined in Proposal 083:
 
-- **Shut down on any failure** — call `proxy.shutdown()` if `errors()` is non-empty
+- **Shut down on any failure** — call `context.shutdown()` if `errors()` is non-empty
 - **Best-effort** — log failures, take no proxy-level action; surviving VCs continue serving
 - **Rollback on failure** — call `reconfigure(oldConfig)` when `errors()` is non-empty
 
@@ -288,7 +311,7 @@ The recommended discrimination is `ex instanceof ConcurrentReconfigureException`
 
 #### Out-of-scope change handling
 
-`reconfigure()` rejects configurations that differ in out-of-scope sections with `OutOfScopeChangeException` (the future completes exceptionally). Like `ConcurrentReconfigureException`, this means the proxy did not change state. The trigger should log the rejection and **not** apply destructive policies (shutdown, rollback).
+Because the bootstrap/reloadable split separates static configuration from reloadable state structurally, `OutOfScopeChangeException` is not expected in trigger-driven reconfiguration — the `Snapshot` contains only reloadable state and there is nothing out-of-scope to detect. However, trigger implementations should handle unexpected exceptions from `reconfigure()` defensively: log the rejection and **not** apply destructive policies (shutdown, rollback).
 
 #### Debouncing
 
@@ -304,22 +327,26 @@ Triggers may perform their own change detection to avoid unnecessary `reconfigur
 
 ### Trigger lifecycle
 
-The trigger lifecycle is tied to the proxy's lifecycle:
+The trigger lifecycle is tied to the proxy's lifecycle. Because the trigger is the sole source of reloadable configuration, the proxy starts in an empty state — bootstrap infrastructure only — and the trigger's first `reconfigure()` call brings virtual clusters to life.
 
 ```
 Proxy startup
     │
-    ├── Parse proxy configuration (including reconfigurationTrigger section)
+    ├── Parse bootstrap configuration (management, trigger selection)
+    ├── Start bootstrap infrastructure (management endpoints, metrics)
     ├── Discover ReconfigurationTriggerFactory via ServiceLoader
-    ├── Deserialize trigger-specific config
+    ├── Deserialize trigger-specific config from bootstrap
     ├── Call factory.create(context, config) → ReconfigurationTrigger
-    │
-    ├── Proxy completes startup (VCs serving)
     │
     ├── Call trigger.start()
     │     │
-    │     ├── Success: trigger is active, watching for changes
-    │     └── Failure: log warning, proxy continues without hot reload
+    │     ├── Trigger reads current config from its source
+    │     ├── Trigger calls context.reconfigure(snapshot)  ← initial load
+    │     ├── VCs come up
+    │     ├── Trigger sets up background watching for changes
+    │     │
+    │     ├── Start success: trigger is active, VCs serving
+    │     └── Start failure: proxy has no VCs, proxy exits
     │
     ├── ... proxy running, trigger calling reconfigure() as needed ...
     │
@@ -331,9 +358,11 @@ Proxy startup
     └── Proxy completes shutdown
 ```
 
-**Startup ordering.** The trigger is started *after* the proxy has completed startup and all virtual clusters are serving. This is why the `ReconfigurationTrigger` interface separates construction (`create()`) from activation (`start()`): the factory creates the trigger during proxy initialisation, but the trigger must not begin watching for changes — or call `reconfigure()` — until the proxy is ready. Without this separation, a file watcher trigger could detect the existing configuration file immediately on construction and attempt a `reconfigure()` before the proxy has loaded its initial configuration, which would throw `IllegalStateException` per Proposal 083.
+**Initial load within `start()`.** The trigger performs the initial configuration load synchronously within `start()`: it reads its source, constructs a `Snapshot`, and calls `context.reconfigure(snapshot)`. This first `reconfigure()` call creates all virtual clusters and brings the proxy to a serving state. Only after the initial load succeeds does the trigger set up background watching for subsequent changes. This means `start()` blocks for the duration of the initial load — which is acceptable because the proxy cannot serve traffic until the first configuration is applied. Subsequent changes happen asynchronously on the trigger's own threads.
 
-**Failure to start.** If the trigger's `start()` method throws, the proxy logs a warning and continues running without hot reload capability. This is a pragmatic choice: the proxy is functional and serving traffic; the operator can diagnose the trigger failure and restart the proxy if hot reload is required. Failing the entire proxy startup because a trigger couldn't start would be disproportionate.
+**Why separate `create()` from `start()`.** The `ReconfigurationTriggerFactory` creates the trigger during proxy initialisation, but `start()` is called separately so that the proxy can complete its own bootstrap (management endpoints, metrics) before the trigger begins loading configuration. This also allows the runtime to handle trigger creation failures differently from trigger start failures.
+
+**Failure to start.** If the trigger's `start()` method throws, the proxy has no virtual clusters and cannot serve traffic. The proxy should exit — an empty proxy with no VCs is not useful, and the operator needs to diagnose the trigger failure. This is a deliberate difference from the trigger-optional model: when a trigger is configured, the proxy depends on it for all reloadable configuration, so a trigger failure is a proxy failure.
 
 **Shutdown ordering.** The trigger is closed *before* the proxy begins its shutdown sequence. This prevents the trigger from attempting a `reconfigure()` call while the proxy is shutting down. Any `reconfigure()` call already in flight will complete independently — the proxy handles the `IllegalStateException` case per Proposal 083.
 
@@ -375,18 +404,25 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
 
     @Override
     public void start() throws Exception {
-        Path watchPath = context.configFilePath();
+        Path watchPath = config.watchPath() != null
+                ? config.watchPath()
+                : context.configFilePath();
+
+        // Initial load — synchronous, brings up VCs for the first time
+        Snapshot snapshot = Snapshot.fromPath(watchPath);
+        context.reconfigure(snapshot).join();
+
+        // Begin watching for subsequent changes
         watchService = FileSystems.getDefault().newWatchService();
-        // register watch on parent directory (handles K8s ConfigMap symlinks)
         watchPath.getParent().register(watchService, ENTRY_MODIFY, ENTRY_CREATE);
 
         watchThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
                 // wait for events, debounce, then:
                 try {
-                    Snapshot snapshot = Snapshot.fromPath(watchPath);
-                    context.validate(snapshot);
-                    context.reconfigure(snapshot)
+                    Snapshot newSnapshot = Snapshot.fromPath(watchPath);
+                    context.validate(newSnapshot);
+                    context.reconfigure(newSnapshot)
                            .whenComplete((result, ex) -> {
                                if (ex instanceof ConcurrentReconfigureException) {
                                    // retry later
@@ -420,12 +456,13 @@ class FileWatcherTrigger implements ReconfigurationTrigger {
 ```
 
 This example demonstrates:
-- The trigger manages its own threads
+- `start()` performs the initial load synchronously, then sets up background watching
+- The initial `reconfigure()` call creates all virtual clusters — same path as subsequent changes
 - The trigger produces a `Snapshot` from the filesystem — other triggers would produce snapshots from other sources
-- `validate()` catches structural and scope errors before any VC experiences downtime
+- `validate()` catches structural errors before any VC experiences downtime
 - `whenComplete()` implements failure policy (best-effort in this case)
 - `ConcurrentReconfigureException` is handled with retry semantics
-- The trigger uses `configFilePath()` as its default watch target
+- The trigger uses its factory config for the watch path, falling back to `configFilePath()`
 
 ## Affected projects
 
@@ -436,11 +473,11 @@ This example demonstrates:
 
 ## Compatibility
 
-- **Additive.** No existing behaviour changes. A proxy with no `reconfigurationTrigger` configuration operates identically to today.
-- **Proposal 083 unchanged.** The `KafkaProxy.reconfigure()` contract, `ReconfigureResult`, `ReconfigureError`, concurrency control, and scope limitations are unchanged.
-- **Configuration format.** The `reconfigurationTrigger` section is new; its absence is a no-op. Because it is an out-of-scope section for `reconfigure()`, any change to it in a new configuration will be rejected with `OutOfScopeChangeException` — which is the correct behaviour (trigger changes require a restart).
+- **Additive.** No existing behaviour changes. A proxy with no `reconfigurationTrigger` configuration operates identically to today — configuration is loaded from a single file at startup and changes require a restart.
+- **Proposal 083 extension.** This proposal extends Proposal 083's `reconfigure()` contract to handle the "from nothing to something" case — where `reconfigure()` is called with no virtual clusters running. This is a natural extension: Proposal 083's remove/replace/add flow already handles the "add" case; when there is no prior state, there is nothing to remove or replace and everything is an add. The `ReconfigureResult`, `ReconfigureError`, and concurrency control contracts are unchanged. `OutOfScopeChangeException` remains part of the Proposal 083 contract for embedded callers who provide a full `Configuration` directly, but is not relevant for trigger-driven reconfiguration because `Snapshot` contains only reloadable state.
+- **Configuration format.** The `reconfigurationTrigger` section is new; its absence means no trigger — the proxy loads configuration at startup as today.
 - **Plugin convention.** The `type` + `config` pattern and `ServiceLoader` discovery follow established Kroxylicious conventions and do not introduce new mechanisms.
-- **Proposal 096 (configuration rework).** This proposal adopts Proposal 096's `Snapshot` abstraction as the type triggers provide to `reconfigure()`. For the current single-file configuration model, `Snapshot` wraps a single YAML string. When Proposal 096's multi-file configuration lands, triggers produce multi-file snapshots through the same interface — no trigger SPI changes required.
+- **Proposal 096 (configuration rework).** This proposal adopts Proposal 096's `Snapshot` abstraction as the type triggers provide to `reconfigure()`. The bootstrap/reloadable split established here is a simpler foundation than Proposal 096's full multi-file structure, but the two are compatible: Proposal 096's ideas — per-plugin versioning, dependency tracking, richer `Snapshot` implementations — can evolve on top of this split. This proposal does not commit to Proposal 096's specific filesystem layout (e.g. `plugins.d/` keyed by plugin interface FQCN).
 
 ## Rejected alternatives
 
@@ -457,3 +494,5 @@ This example demonstrates:
 - **Proxy-managed configuration persistence**: An earlier design had the proxy persist the applied configuration to disk after a successful `reconfigure()`. Rejected because persistence requirements vary by deployment: a Kubernetes operator owns state via CRD and does not want the proxy overwriting files; a bare-metal deployment may want file persistence; a custom control plane may persist to a database. This is a trigger concern, not a proxy concern.
 
 - **Trigger configuration in `updateStrategy` or `configurationReload` YAML block**: Earlier iterations of Proposal 083 proposed YAML-level configuration for failure policy and rollback behaviour. Rejected in favour of caller-side policy via `whenComplete()` — the proxy reports outcomes and takes no policy action. The only YAML configuration for triggers is the `reconfigurationTrigger` section that selects and configures the trigger implementation.
+
+- **Runtime loads initial configuration, trigger handles subsequent changes**: An earlier version of this proposal had the proxy load its initial configuration directly at startup (via the constructor, as in Proposal 083), with the trigger only responsible for detecting and applying subsequent changes. Rejected because it creates two code paths for configuration loading: one in the runtime (startup) and one in the trigger (reload). The unified model — where the trigger is the sole source of reloadable configuration, including the initial load — is simpler, eliminates the two-path inconsistency, and gives the trigger control over initial validation and failure policy from the start.
