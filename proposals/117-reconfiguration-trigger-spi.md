@@ -28,7 +28,7 @@ The controller SPI consists of three interfaces:
 
 - **`VirtualClusterConfigController`** — the controller implementation itself, created by the factory. It sources virtual cluster configuration, detects changes, and drives `reconfigure()`.
 - **`VirtualClusterConfigControllerFactory`** — discovered via `ServiceLoader`, responsible for creating a `VirtualClusterConfigController` from its typed configuration.
-- **`VirtualClusterConfigControllerContext`** — provided by the runtime, gives the controller access to `reconfigure()`, `shutdown()`, and pre-flight validation. Controllers provide configuration as a `Snapshot` (adopted from Proposal 096) — a source-agnostic representation of the virtual cluster configuration that decouples the controller from the configuration format.
+- **`VirtualClusterConfigControllerContext`** — provided by the runtime, gives the controller access to `reconfigure()`, `validate()`, and `shutdown()`. Controllers provide configuration as a `Snapshot` (adopted from Proposal 096) — a source-agnostic representation of the virtual cluster configuration that decouples the controller from the configuration format.
 
 The name "controller" borrows from the Kubernetes controller pattern: a control loop that watches desired state, detects drift, and reconciles. A `VirtualClusterConfigController` does the same — it watches a configuration source, detects changes, and reconciles the proxy's running state to match via `reconfigure()`. The failure handling, retry, and rollback responsibilities are natural parts of this reconciliation loop.
 
@@ -164,18 +164,19 @@ The `Snapshot` interface is defined in Proposal 096. This proposal does not rede
  * controller's view of the proxy — controllers never interact with
  * {@code KafkaProxy} directly.
  *
- * <p>The context provides three categories of capability:
+ * <p>The context provides three capabilities:
  * <ul>
  *   <li><b>Reconfiguration</b> — {@link #reconfigure(Snapshot)} drives
  *       the proxy to converge to a new configuration. The controller provides
  *       a {@link Snapshot} representing the desired virtual cluster configuration; the
  *       runtime handles parsing and change detection internally.</li>
+ *   <li><b>Validation</b> — {@link #validate(Snapshot)} allows controllers to
+ *       pre-validate a snapshot before applying it, catching structural
+ *       errors before any virtual cluster experiences downtime. Returns a
+ *       {@link ValidationResult} with errors deduplicated by root cause.</li>
  *   <li><b>Proxy lifecycle</b> — {@link #shutdown()} initiates an orderly
  *       proxy shutdown, enabling failure policies that terminate the proxy
  *       on unrecoverable errors.</li>
- *   <li><b>Validation</b> — {@link #validate(Snapshot)} allows controllers to
- *       pre-validate a snapshot before applying it, catching structural
- *       errors before any virtual cluster experiences downtime.</li>
  * </ul>
  *
  * <p>The context is thread-safe. All methods may be called from any thread.
@@ -230,23 +231,18 @@ public interface VirtualClusterConfigControllerContext {
      * and application. But it does guarantee that the snapshot will not be
      * rejected for structural reasons.
      *
+     * <p>The returned {@link ValidationResult} collects all errors found
+     * during validation, deduplicated by root cause. For example, if a
+     * single unknown filter type is referenced by multiple virtual clusters,
+     * the result reports the root cause once rather than once per usage.
+     * This prevents cascading errors from obscuring the actual problem.
+     *
      * @param config the snapshot to validate
-     * @throws ConfigurationException if the snapshot cannot be parsed or
-     *         fails validation
+     * @return a {@link ValidationResult} describing any validation errors.
+     *         Call {@link ValidationResult#isValid()} to check whether the
+     *         snapshot passed validation.
      */
-    void validate(Snapshot config);
-
-    /**
-     * Returns the path that was passed to the proxy at startup.
-     *
-     * <p>This path does not change during the proxy's lifetime. File-based
-     * controllers may use it as a default location for their configuration
-     * source. Controllers that source configuration from non-filesystem
-     * origins may ignore it.
-     *
-     * @return the startup configuration path
-     */
-    Path configFilePath();
+    ValidationResult validate(Snapshot config);
 }
 ```
 
@@ -285,7 +281,7 @@ The controller is responsible for obtaining and delivering a new `Snapshot` to `
 
 #### Validation
 
-Controllers can use `validate(Snapshot)` to pre-validate a snapshot before applying it. This performs the same pre-flight checks as `reconfigure()` — parsing and static validation — without modifying any running state. This enables a validate-then-apply workflow that catches problems before any virtual cluster experiences downtime.
+Controllers can use `validate(Snapshot)` to pre-validate a snapshot before applying it. This performs the same pre-flight checks as `reconfigure()` — parsing and static validation — without modifying any running state. The returned `ValidationResult` collects all errors found during validation, deduplicated by root cause — so a single misconfigured plugin referenced by many virtual clusters produces one error, not one per usage. This enables a validate-then-apply workflow that catches problems before any virtual cluster experiences downtime.
 
 #### Failure policy
 
@@ -406,9 +402,7 @@ class FileWatcherController implements VirtualClusterConfigController {
 
     @Override
     public void start() throws Exception {
-        Path watchPath = config.watchPath() != null
-                ? config.watchPath()
-                : context.configFilePath();
+        Path watchPath = config.watchPath();
 
         // Initial load — synchronous, brings up VCs for the first time
         Snapshot snapshot = Snapshot.fromPath(watchPath);
@@ -421,28 +415,29 @@ class FileWatcherController implements VirtualClusterConfigController {
         watchThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
                 // wait for events, debounce, then:
-                try {
-                    Snapshot newSnapshot = Snapshot.fromPath(watchPath);
-                    context.validate(newSnapshot);
-                    context.reconfigure(newSnapshot)
-                           .whenComplete((result, ex) -> {
-                               if (ex instanceof ConcurrentReconfigureException) {
-                                   // retry later
-                                   return;
-                               }
-                               if (ex != null) {
-                                   LOG.error("Reconfigure failed", ex);
-                                   return;
-                               }
-                               for (var error : result.errors()) {
-                                   LOG.error("Component failed: {}",
-                                             error.humanReadableIdentifier(),
-                                             error.cause());
-                               }
-                           });
-                } catch (ConfigurationException e) {
-                    LOG.error("Failed to validate configuration", e);
+                Snapshot newSnapshot = Snapshot.fromPath(watchPath);
+                ValidationResult validation = context.validate(newSnapshot);
+                if (!validation.isValid()) {
+                    LOG.error("Configuration validation failed: {}",
+                              validation.errors());
+                    continue;
                 }
+                context.reconfigure(newSnapshot)
+                       .whenComplete((result, ex) -> {
+                           if (ex instanceof ConcurrentReconfigureException) {
+                               // retry later
+                               return;
+                           }
+                           if (ex != null) {
+                               LOG.error("Reconfigure failed", ex);
+                               return;
+                           }
+                           for (var error : result.errors()) {
+                               LOG.error("Component failed: {}",
+                                         error.humanReadableIdentifier(),
+                                         error.cause());
+                           }
+                       });
             }
         });
         watchThread.setDaemon(true);
@@ -461,10 +456,9 @@ This example demonstrates:
 - `start()` performs the initial load synchronously, then sets up background watching
 - The initial `reconfigure()` call creates all virtual clusters — same path as subsequent changes
 - The controller produces a `Snapshot` from the filesystem — other controllers would produce snapshots from other sources
-- `validate()` catches structural errors before any VC experiences downtime
+- `validate()` returns a `ValidationResult` — the controller checks `isValid()` and logs errors without catching exceptions
 - `whenComplete()` implements failure policy (best-effort in this case)
 - `ConcurrentReconfigureException` is handled with retry semantics
-- The controller uses its factory config for the watch path, falling back to `configFilePath()`
 
 ## Affected projects
 
