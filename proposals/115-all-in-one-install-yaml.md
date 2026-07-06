@@ -142,11 +142,11 @@ Examples move to dedicated archives separate from install manifests:
 
 ### Backwards Compatibility
 
-**Preserved:** Existing `.tar.gz` and `.zip` archives continue to be published for 2 releases (v0.22.0, v0.23.0).
+**Preserved:** Existing `.tar.gz` and `.zip` archives continue to be published alongside the new manifest artifacts.
 
-**Deprecated:** These combined archives marked as deprecated in release notes.
+**Deprecated:** The deprecation of these combined archives will be announced in the CHANGELOG of the next release (at time of writing v0.23.0).
 
-**Removed:** Archives removed in v0.24.0 (gives users 2 releases to migrate).
+**Removed:** Archives will be removed following the project's [standard deprecation policy](https://github.com/kroxylicious/kroxylicious/blob/main/DEV_GUIDE.md#deprecation-policy) unless preempted by the v1.0.0 release.
 
 **Migration path:** Documentation provides clear instructions for switching from archive-based to manifest-based installation.
 
@@ -164,13 +164,7 @@ Examples move to dedicated archives separate from install manifests:
 
 **Timeline:**
 
-Combined archives will be deprecated immediately in v0.22.0 and removed at the **v1.0.0 milestone** (whichever comes first: v0.24.0 or v1.0.0).
-
-| Release | Archive Status | Manifest Status | Notes |
-|---------|---------------|-----------------|-------|
-| v0.22.0 | ⚠️ **Deprecated** - Published with deprecation notice | ✅ **New** - Full support | Introduction release. Release notes highlight new manifests as recommended approach. |
-| v0.23.0 | ⚠️ **Deprecated** - Published | ✅ **Supported** | Deprecation notice continues in release notes. |
-| v0.24.0 or v1.0.0 | ❌ **Removed** - No longer published | ✅ **Supported** | Archives removed at v1.0.0 milestone or v0.24.0, whichever comes first. |
+Combined archives will be deprecated in the next release (at time of writing v0.23.0). Removal follows the project's [standard deprecation policy](https://github.com/kroxylicious/kroxylicious/blob/main/DEV_GUIDE.md#deprecation-policy): eligible for removal in the third minor release following deprecation, with at least three months elapsed, unless preempted by the v1.0.0 release.
 
 **What gets deprecated:**
 - `kroxylicious-operator-{version}.tar.gz` (combined install + examples)
@@ -189,25 +183,25 @@ Combined archives will be deprecated immediately in v0.22.0 and removed at the *
 
 *For users currently using archives:*
 
-Before (v0.21.0 and earlier):
+Before (current):
 ```bash
 # Download archive
-curl -L https://github.com/kroxylicious/kroxylicious/releases/download/v0.21.0/kroxylicious-operator-0.21.0.tar.gz | tar xz
+curl -L https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-0.22.0.tar.gz | tar xz
 
 # Navigate to install directory
-cd kroxylicious-operator-0.21.0/install
+cd kroxylicious-operator-0.22.0/install
 
 # Apply manifests
 kubectl apply -f .
 ```
 
-After (v0.22.0 and later):
+After (v0.23.0 and later):
 ```bash
 # Direct installation (no download/extract needed)
-kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
+kubectl apply -f https://github.com/kroxylicious/kroxylicious/releases/download/v0.23.0/kroxylicious-operator-dist-0.23.0-install.yaml
 
 # Download examples separately (only if needed)
-curl -L https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-examples.tar.gz | tar xz
+curl -L https://github.com/kroxylicious/kroxylicious/releases/download/v0.23.0/kroxylicious-operator-dist-0.23.0-examples.tar.gz | tar xz
 ```
 
 *For GitOps users:*
@@ -219,14 +213,8 @@ After: Direct reference to release URL:
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.22.0/kroxylicious-operator-dist-0.22.0-install.yaml
+  - https://github.com/kroxylicious/kroxylicious/releases/download/v0.23.0/kroxylicious-operator-dist-0.23.0-install.yaml
 ```
-
-**Rationale for 3-release timeline:**
-- v0.22.0: Users discover new approach, begin migration
-- v0.23.0: Final warning allows remaining users to migrate
-- v0.24.0: Clean removal with clear documented migration path
-- Matches Kubernetes deprecation guidelines (minimum 2 releases notice)
 
 ## Rejected alternatives
 
