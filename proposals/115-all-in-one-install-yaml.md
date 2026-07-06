@@ -1,12 +1,3 @@
-<!--
-To submit this proposal:
-1. Copy to kroxylicious/design repo as proposals/000-rendered-install-manifests.md
-2. Open a PR
-3. Rename file using PR number: proposals/<PR#>-rendered-install-manifests.md
-4. Update heading to include PR number
-5. Push changes
--->
-
 # 115 - All-in-one Install YAML Manifests for GitOps
 
 Publish all-in-one Kubernetes installation manifests as GitHub release assets to enable GitOps workflows and direct installation without downloading archives.
