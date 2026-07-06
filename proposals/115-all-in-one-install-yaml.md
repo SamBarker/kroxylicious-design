@@ -30,6 +30,16 @@ This pattern enables one-command installation:
 kubectl apply -f https://github.com/project/releases/download/v1.0.0/install.yaml
 ```
 
+### Allowing for separate CRD management
+
+In Kubernetes, CRDs are globally shared cluster resources that require special handling.
+Cluster admins often need to install CRDs before operators to resolve circularity issues that occur between interdependent operators.
+Separate CRDs bundles exist to support this use-case.
+
+```bash
+kubectl apply -f https://github.com/project/releases/download/v1.0.0/crds.yaml
+```
+
 **GitOps integration:** GitOps tools can reference these URLs directly in their configuration, enabling automated deployment and upgrades.
 
 ## Proposal
@@ -54,7 +64,7 @@ All artifacts follow Maven classifier naming conventions:
 | Artifact | Maven Coordinates | Use Case |
 |----------|-------------------|----------|
 | `kroxylicious-admission-dist-{version}-install.yaml` | `io.kroxylicious:kroxylicious-admission-dist:install:yaml` | Complete installation (CRDs + webhook) |
-| `kroxylicious-admission-dist-{version}-crds.yaml` | `io.kroxylicious:kroxylicious-admission-dist:crds:yaml` | CRDs only |
+| `kroxylicious-admission-dist-{version}-crds.yaml` | `io.kroxylicious:kroxylicious-admission-dist:crds:yaml` | CRDs only for separate lifecycle management |
 | `kroxylicious-admission-dist-{version}-examples.tar.gz` | `io.kroxylicious:kroxylicious-admission-dist:examples:tar.gz` | Example configurations |
 | `kroxylicious-admission-dist-{version}-examples.zip` | `io.kroxylicious:kroxylicious-admission-dist:examples:zip` | Example configurations (ZIP) |
 
