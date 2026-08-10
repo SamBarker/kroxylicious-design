@@ -230,6 +230,9 @@ deliberately not configurable:
 
 - `SaslAuthenticate` — carries credential material for PLAIN and SCRAM
 - `CreateDelegationToken` — the response carries the token HMAC, which is itself a credential
+- `RenewDelegationToken` — the request carries the token HMAC, which identifies the token and is
+  itself a credential
+- `ExpireDelegationToken` — the request likewise carries the token HMAC
 - `AlterUserScramCredentials` — carries salt and salted password material
 - `DescribeDelegationToken`
 
