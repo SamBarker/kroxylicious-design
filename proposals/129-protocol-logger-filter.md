@@ -33,7 +33,7 @@ which are proposed here. Framing that as out of scope now avoids the feature dri
 
 ## Motivation
 
-Three audiences benefit:
+Four audiences benefit:
 
 - **Debugging.** Seeing the exact requests a client sends, the versions it negotiates, and the
   errors it receives is often the fastest route to a diagnosis. This is particularly true for
@@ -70,20 +70,20 @@ was actually transmitted, a field appearing at a default value when the client n
 misleading, and version negotiation problems are exactly the kind of thing someone would use this
 filter to investigate.
 
-### Record contents are not logged
+### Record contents are not logged initially
 
-The filter logs protocol structure, not the data being carried. For the four message types with
-records-typed fields, the record batch — keys, values and headers — does not appear in the output.
+The filter logs protocol structure rather than the data being carried. For the message types
+with records-typed fields, the record batch — keys, values and headers — does not appear in the
+output in the initial implementation.
 
-This falls out of the implementation: Kafka's generated JSON converters emit an empty byte array
-for records-typed fields regardless of content. It is also the intended behaviour. Record contents
-are user data, potentially personal or regulated, and the value of this filter is in showing
-message flow rather than message content.
+This is not a permanent exclusion. Logging record contents is anticipated as a future extension
+and is described under Future extensions below; it is out of scope here because what to emit
+needs design work of its own rather than because record contents are unwanted.
 
-Note this does not mean the output is small. Only four message types carry records at all, and
-protocol structure alone can be substantial — a `Metadata` response describing ten thousand
-partitions, or a `Produce` request spanning many partitions, contains no record data and is still
-large. That is what `maxPayloadChars` bounds.
+Note that excluding records does not make the output small. Only four message types carry
+records at all, and protocol structure alone can be substantial — a `Metadata` response
+describing ten thousand partitions, or a `Produce` request spanning many partitions, contains no
+record data and is still large.
 
 ### Implementation approach
 
@@ -161,13 +161,12 @@ consumers of the output should expect that.
 
 ```yaml
 filterDefinitions:
-  - name: trace-downstream
+  - name: log-downstream
     type: ProtocolLogger
     config:
       logLevel: DEBUG                                        # default
       loggerName: protocol.downstream                        # optional
       apiKeyNames: [METADATA, FIND_COORDINATOR, JOIN_GROUP]  # absent or empty = all
-      maxPayloadChars: 8192                                  # default, must be > 0
 ```
 
 | Key | Type | Default | Purpose |
@@ -175,14 +174,8 @@ filterDefinitions:
 | `logLevel` | SLF4J level | `DEBUG` | Level at which entries are emitted, and the level the backend must be enabled at |
 | `loggerName` | string | the filter class name | Logger to emit under; distinguishes multiple instances in one chain |
 | `apiKeyNames` | list of `ApiKeys` names | all | Which API keys to log |
-| `maxPayloadChars` | integer | 8192 | Truncation limit for `payload`; `header` is never truncated |
 
-`maxPayloadChars` bounds the serialised `payload` only. Record contents are never included, but
-message structure can still be substantial. When the limit is exceeded, `payload` is replaced with
-a truncated representation and flagged, so the entry as a whole remains valid JSON.
-
-Invalid API key names and a non-positive `maxPayloadChars` are rejected at startup rather than
-discovered at log time.
+Invalid API key names are rejected at startup rather than discovered at log time.
 
 ### Multiple instances in one chain
 
@@ -242,7 +235,7 @@ deliberately not configurable:
 
 For these keys the converter is not invoked at all; the body is structurally withheld rather than
 filtered after the fact. The header is still emitted, so an operator can see that a handshake
-occurred and correlate it, while the body never reaches the converter at all:
+occurred and correlate it:
 
 ```json
 {
@@ -280,7 +273,7 @@ an issue; the default should not be something an operator can accidentally weake
 ## Compatibility
 
 The plugin configuration YAML introduced here becomes public API and must remain compatible with
-existing configurations. The surface is deliberately small: four keys, all optional, all with
+existing configurations. The surface is deliberately small: three keys, all optional, all with
 defaults, so a configuration specifying only `type: ProtocolLogger` is valid and remains so.
 `loggerName` is intentionally free-form and not validated.
 
@@ -295,6 +288,42 @@ not a breaking change.
 The proposed `logLevel` default of `DEBUG` means adding the filter to an existing configuration
 produces no output until the logging backend is also configured, which avoids surprising volume
 on upgrade.
+
+## Future extensions
+
+### Logging record contents
+
+Reviewers noted that filter and router developers are often as interested in the message as in
+the protocol wrapper, and that some of the most useful demonstrations involve records — showing
+that the record encryption filter really does transmit ciphertext, or what a record that record
+validation rejected actually contained. This is anticipated as a future extension rather than
+something excluded on principle.
+
+It is deferred because it needs design work rather than a switch. Kafka's generated JSON
+converters emit an empty byte array for records-typed fields and offer no mode that preserves
+the content, so this means serialising `MemoryRecords` directly and splicing the result into the
+output. Beyond that, what to emit is an open question:
+
+- Base64 for record keys, values and header values, so that content can be inspected in a hex
+  viewer without the filter having to guess whether the payload is Avro, protobuf, UTF-8 or
+  ciphertext.
+- A full accounting of record batch attributes — whether records are control records, which
+  compression codec is in use, and so on — so that batching behaviour is visible and not just
+  record content.
+- Record batches are frequently compressed, so raw batch bytes would render as noise. Emitting
+  decompressed per-record fields is what makes the content inspectable, and is also the right
+  granularity for the encryption case, since record encryption operates per record value.
+- A size limit on record keys and values. Record contents can be arbitrarily large, so
+  truncating them would be worthwhile — unlike the protocol structure, which is bounded by the
+  shape of the cluster and which `jq` consumers need intact.
+
+A high-fidelity representation along these lines would have a secondary use in the project's own
+tests, where preservation of batching and record attributes needs checking.
+
+This is expected to become easier to implement once #116 is complete.
+
+When added, it would be opt-in and default to off: record contents are user data and potentially
+regulated, so inclusion should be a deliberate choice even in a debugging tool.
 
 ## Rejected alternatives
 
@@ -321,11 +350,6 @@ to know field names from generated classes, its value is speculative if the excl
 correct, and a model-driven approach — annotating sensitive fields — would be a better shape if
 this becomes necessary.
 
-**An option to log record payloads.** Rejected. Beyond the data protection concerns, the result
-depends on the filter's position in the chain: placed before a record encryption filter it would
-log plaintext, placed after it would log ciphertext. An option whose meaning varies with
-configuration in a way its name does not convey is misleading.
-
 **Computing request/response latency.** Deferred. It would require the filter to hold state
 across calls — a bounded map from correlation identifier to timestamp — which is the only part of
 the design that could leak memory. Log timestamps and the correlation identifier already allow
@@ -334,7 +358,3 @@ latency to be derived. This can be added later if there is demand.
 **Relying on broker request logging.** Does not require any change to Kroxylicious, but does not
 serve the same purpose: it is unavailable to proxy operators who do not administer the broker,
 and does not show traffic as the proxy sees it relative to other filters in the chain.
-
-**Always-on audit logging.** A filter continuously recording all traffic for compliance purposes
-would need sampling, back-pressure handling, structured output and retention design. That is a
-substantially larger piece of work with different requirements, and is not proposed here.
